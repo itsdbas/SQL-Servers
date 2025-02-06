@@ -1,0 +1,2929 @@
+# -----------------------------------------------------------------------------
+# Author:      Ketan Chawda (Modified)
+# Date:        Nov 2017
+#
+# File Name:   Invoke-MorningHealthChecks.ps1
+#
+# Purpose:     PowerShell script to automate morning health checks.
+#
+# History:
+# Date         Comment
+# -----------  ----------------------------------------------------------------
+# 06 Nov 2017  Created
+# 27 May 2020  Changed error trapping to continue processing when a server is offline.
+# 27 May 2020  Added "is enabled" check for the failed jobs function.
+# 27 May 2020  Fixed bug in the database status funtion for mirrored databases.
+# 27 May 2020  Added a new check for Windows Cluster node status.
+# 27 May 2020  Added a new check for SQL service(s) status.
+# -----------------------------------------------------------------------------
+#
+# Copyright (C) 2020 Microsoft Corporation
+#
+# Paramaters:
+#   $cmsServer - Name of the CMS server where your list of SQL Servers is registered.
+#   $cmsGroup - Name of the CMS group that will be evaluated.
+#   $serverList - Comma delimited list of SQL Servers that will be evaluated.
+#
+# Important note: 
+#   Either "$cmsServer/$cmsGroup" or "$serverList" parameter should have values specified, but NOT BOTH.
+#
+# Example 1 uses the CMS parameters to check servers in the 'SQL2012' CMS group that is a subfolder of 'PROD':
+#   Invoke-MorningHealthChecks.ps1 -cmsServer 'SOLO\CMS' -cmsGroup 'PROD\SQL2012'
+#
+# Example 2 uses the $serverList paramenter to check 4 different SQL Servers:
+#   Invoke-MorningHealthChecks.ps1 -serverList 'CHEWIE','CHEWIE\SQL01','LUKE\SKYWALKER','LANDO\CALRISSIAN'
+# winrm quickconfig - firewall[s] are allowing ports 5985 and 5986 
+# -----------------------------------------------------------------------------
+
+####################   SCRIPT-LEVEL PARAMETERS   ########################
+param(
+  [CmdletBinding()]
+  [Parameter(ParameterSetName='Set1',Position=0,Mandatory=$true)][String]$cmsServer,
+  [parameter(ParameterSetName='Set1',Position=1,Mandatory=$false)][String]$cmsGroup,
+  [parameter(ParameterSetName='Set2',Position=2,Mandatory=$true)][String[]]$serverList
+)
+
+####################   LOAD ASSEMBLIES   ########################
+
+#Attempt to load assemblies by name starting with the latest version
+try {
+  #SMO v14 - SQL Server 2017
+  Add-Type -AssemblyName 'Microsoft.SqlServer.ConnectionInfo, Version=14.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91' -ErrorAction Stop
+  Add-Type -AssemblyName 'Microsoft.SqlServer.Management.RegisteredServers, Version=14.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91' -ErrorAction Stop
+}
+catch {
+  try {
+    #SMO v13 - SQL Server 2016
+    Add-Type -AssemblyName 'Microsoft.SqlServer.ConnectionInfo, Version=13.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91' -ErrorAction Stop
+    Add-Type -AssemblyName 'Microsoft.SqlServer.Management.RegisteredServers, Version=13.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91' -ErrorAction Stop
+  }
+  catch {
+    try {
+      #SMO v12 - SQL Server 2014
+      Add-Type -AssemblyName 'Microsoft.SqlServer.ConnectionInfo, Version=12.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91' -ErrorAction Stop
+      Add-Type -AssemblyName 'Microsoft.SqlServer.Management.RegisteredServers, Version=12.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91' -ErrorAction Stop
+    }
+    catch {
+      try {
+        #SMO v11 - SQL Server 2012
+        Add-Type -AssemblyName 'Microsoft.SqlServer.ConnectionInfo, Version=11.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91' -ErrorAction Stop
+        Add-Type -AssemblyName 'Microsoft.SqlServer.Management.RegisteredServers, Version=11.0.0.0, Culture=neutral, PublicKeyToken=89845dcd8080cc91' -ErrorAction Stop
+      }
+      catch {
+        Write-Warning 'SMO components not installed. Download from https://goo.gl/E700bG'
+        Break
+      }
+    }
+  }
+}
+
+####################   FUNCTIONS   ########################
+function Get-Error {
+  <#
+      .SYNOPSIS
+      Processes errors encoutered in PowerShell code.
+      .DESCRIPTION
+      The Get-SqlConnection function processes either PowerShell errors or application errors defined within your code.
+      .INPUTS
+      None
+      .OUTPUTS
+      None
+      .EXAMPLE
+      try { 1/0 } catch { Get-Error $Error }
+      This passes the common error object (System.Management.Automation.ErrorRecord) for processing.
+      .EXAMPLE
+      try { 1/0 } catch { Get-Error "You attempted to divid by zero. Try again." }
+      This passes a string that is output as an error message.
+      .LINK
+      Get-SqlConnection 
+  #>
+  param(
+    [CmdletBinding()]
+    [Parameter(Position=0,ParameterSetName='PowerShellError',Mandatory=$true)] [System.Management.Automation.ErrorRecord]$PSError,
+    [Parameter(Position=0,ParameterSetName='ApplicationError',Mandatory=$true)] [string]$AppError,
+		[Parameter(Position=1,Mandatory=$false)] [switch]$ContinueAfterError
+  )
+
+  if ($PSError) {
+    #Process a PowerShell error
+    Write-Host '******************************'
+    Write-Host "Error Count: $($PSError.Count)"
+    Write-Host '******************************'
+
+    $err = $PSError.Exception
+    Write-Host $err.Message
+    $err = $err.InnerException
+    while ($err.InnerException) {
+      Write-Host $err.InnerException.Message
+      $err = $err.InnerException
+    }
+    if ($ContinueAfterError) { Continue }
+    else { Throw }
+  }
+  elseif ($AppError) {
+    #Process an application error
+    Write-Host '******************************'
+    Write-Host 'Error Count: 1'
+    Write-Host '******************************'
+    Write-Host $AppError
+    if ($ContinueAfterError) { Continue }
+    else { Throw }
+  }
+} #Get-Error
+
+function Get-SqlConnection {
+  <#
+      .SYNOPSIS
+      Gets a ServerConnection.
+      .DESCRIPTION
+      The Get-SqlConnection function  gets a ServerConnection to the specified SQL Server.
+      .INPUTS
+      None
+      You cannot pipe objects to Get-SqlConnection 
+      .OUTPUTS
+      Microsoft.SqlServer.Management.Common.ServerConnection
+      Get-SqlConnection returns a Microsoft.SqlServer.Management.Common.ServerConnection object.
+      .EXAMPLE
+      Get-SqlConnection "Z002\sql2K8"
+      This command gets a ServerConnection to SQL Server Z002\SQL2K8.
+      .EXAMPLE
+      Get-SqlConnection "Z002\sql2K8" "sa" "Passw0rd"
+      This command gets a ServerConnection to SQL Server Z002\SQL2K8 using SQL authentication.
+      .LINK
+      Get-SqlConnection 
+  #>
+  param(
+    [CmdletBinding()]
+    [Parameter(Mandatory=$true)] [string]$sqlserver,
+    [string]$username, 
+    [string]$password,
+    [Parameter(Mandatory=$false)] [string]$applicationName='Morning Health Checks'
+  )
+
+  Write-Verbose "Get-SqlConnection $sqlserver"
+    
+    if($Username -and $Password){
+        try { $con = new-object ('Microsoft.SqlServer.Management.Common.ServerConnection') $sqlserver,$username,$password }
+        catch { Get-Error $_ }
+    }
+    else {
+        try { $con = new-object ('Microsoft.SqlServer.Management.Common.ServerConnection') $sqlserver }
+        catch { Get-Error $_ }
+    }
+	
+  $con.ApplicationName = $applicationName
+  try {
+    $con.Connect()
+  }
+  catch {
+    Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $targetServer`n"
+    Get-Error $_ -ContinueAfterError
+  }
+
+  Write-Output $con
+    
+} #Get-ServerConnection
+
+function Get-CmsServer {
+  <#
+      .SYNOPSIS
+      Returns a list of SQL Servers from a CMS server.
+
+      .DESCRIPTION
+      Parses registered servers in CMS to return a list of SQL Servers for processing.
+
+      .INPUTS
+      None
+      You cannot pipe objects to Get-CmsServer 
+
+      .OUTPUTS
+      Get-CmsServer returns an array of strings.
+ 
+      .PARAMETER cmsServer
+      The name of the CMS SQL Server including instance name.
+
+      .PARAMETER cmsGroup
+      OPTIONAL. The name of a group (and path) in the CMS server.
+
+      .PARAMETER recurse
+      OPTIONAL. Return all servers that may exist in subfolders below cmsFolder.
+
+      .PARAMETER unique
+      OPTIONAL. Returns a unique list of servers. This is helpful if you have the same SQL server registered in multiple groups.
+
+      .NOTES
+      Includes code from Chrissy LeMarie (@cl).
+      https://blog.netnerds.net/smo-recipes/central-management-server/
+
+      .EXAMPLE
+      Get-CmsServer -cmsServer "SOLO\CMS"
+      Returns a list of all registered servers that are on the CMS server.
+
+      .EXAMPLE
+      Get-CmsServer -cmsServer "SOLO\CMS" -cmsFolder "SQL2012" -recurse
+      Returns a list of all registered servers that are in the SQL2012 folder and any subfolders that exist below it.
+
+      .EXAMPLE
+      Get-CmsServer -cmsServer "SOLO\CMS" -cmsFolder "SQL2012\Cluster" -unique
+      Returns a list of all unique (distinct) registered servers that are in the folder for this exact path "SQL2012\Cluster".
+
+      .LINK
+      http://www.patrickkeisler.com/
+  #>
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$cmsServer,
+    [parameter(Position=1)][String]$cmsGroup,
+    [parameter(Position=2)][Switch]$recurse,
+    [parameter(Position=3)][Switch]$unique
+  ) 
+
+  switch ($cmsServer.GetType().Name) {
+    'String' { 
+      try {
+        $sqlConnection = Get-SqlConnection -sqlserver $cmsServer
+        $cmsStore = new-object Microsoft.SqlServer.Management.RegisteredServers.RegisteredServersStore($sqlConnection)
+      }
+      catch {
+        Get-Error $_
+      }
+    }
+    'RegisteredServersStore' { $cmsStore = $cmsServer }
+    default { Get-Error "Get-CmsGroup:Param `$cmsStore must be a String or ServerConnection object." }
+  }
+
+  Write-Verbose "Get-CmsServer $($cmsStore.DomainInstanceName) $cmsGroup $recurse $unique"
+
+  ############### Declarations ###############
+
+  $collection = @()
+  $newcollection = @()
+  $serverList = @()
+  $cmsFolder = $cmsGroup.Trim('\')
+
+  ############### Functions ###############
+
+  Function Parse-ServerGroup {
+    Param (
+      [CmdletBinding()]
+      [parameter(Position=0)][Microsoft.SqlServer.Management.RegisteredServers.ServerGroup]$serverGroup,
+      [parameter(Position=1)][System.Object]$collection
+    )
+
+    #Get registered instances in this group.
+    foreach ($instance in $serverGroup.RegisteredServers) {
+      $urn = $serverGroup.Urn
+      $group = $serverGroup.Name
+      $fullGroupName = $null
+ 
+      for ($i = 0; $i -lt $urn.XPathExpression.Length; $i++) {
+        $groupName = $urn.XPathExpression[$i].GetAttributeFromFilter('Name')
+        if ($groupName -eq 'DatabaseEngineServerGroup') { $groupName = $null }
+        if ($i -ne 0 -and $groupName -ne 'DatabaseEngineServerGroup' -and $groupName.Length -gt 0 ) {
+          $fullGroupName += "$groupName\"
+        }
+      }
+
+      #Add a new object for each registered instance.
+      $object = New-Object PSObject -Property @{
+        Server = $instance.ServerName
+        Group = $groupName
+        FullGroupPath = $fullGroupName
+      }
+      $collection += $object
+    }
+ 
+    #Loop again if there are more sub groups.
+    foreach($group in $serverGroup.ServerGroups)
+    {
+      $newobject = (Parse-ServerGroup -serverGroup $group -collection $newcollection)
+      $collection += $newobject     
+    }
+    return $collection
+  }
+
+  ############### Main Execution Get-CmsServer ###############
+
+  #Get a list of all servers in the CMS store
+  foreach ($serverGroup in $cmsStore.DatabaseEngineServerGroup) {  
+    $serverList = Parse-ServerGroup -serverGroup $serverGroup -collection $newcollection
+  }
+
+  #Set default to recurse if $cmsFolder is blank
+  if ($cmsFolder -eq '') {$recurse = $true}
+
+  if(($cmsFolder.Split('\')).Count -gt 1) {
+    if($recurse.IsPresent) {
+      #Return ones in this folder and subfolders
+      $cmsFolder = "*$cmsFolder\*"
+      if($unique.IsPresent) {
+        $output = $serverList | Where-Object {$_.FullGroupPath -like $cmsFolder} | Select-Object Server -Unique
+      }
+      else {
+        $output = $serverList | Where-Object {$_.FullGroupPath -like $cmsFolder} | Select-Object Server
+      }
+    }
+    else {
+      #Return only the ones in this folder
+      $cmsFolder = "$cmsFolder\"
+      if($unique.IsPresent) {
+        $output = $serverList | Where-Object {$_.FullGroupPath -eq $cmsFolder} | Select-Object Server -Unique
+      }
+      else {
+        $output = $serverList | Where-Object {$_.FullGroupPath -eq $cmsFolder} | Select-Object Server
+      }
+    }
+  }
+  elseif (($cmsFolder.Split('\')).Count -eq 1 -and $cmsFolder.Length -ne 0) {
+    if($recurse.IsPresent) {
+      #Return ones in this folder and subfolders
+      $cmsFolder = "*$cmsFolder\*"
+      if($unique.IsPresent) {
+        $output = $serverList | Where-Object {$_.FullGroupPath -like $cmsFolder} | Select-Object Server -Unique
+      }
+      else {
+        $output = $serverList | Where-Object {$_.FullGroupPath -like $cmsFolder} | Select-Object Server
+      }
+    }
+    else {
+      #Return only the ones in this folder
+      if($unique.IsPresent) {
+        $output = $serverList | Where-Object {$_.Group -eq $cmsFolder} | Select-Object Server -Unique
+      }
+      else {
+        $output = $serverList | Where-Object {$_.Group -eq $cmsFolder} | Select-Object Server
+      }
+    }
+  }
+  elseif ($cmsFolder -eq '' -or $cmsFolder -eq $null) {
+    if($recurse.IsPresent) {
+      if($unique.IsPresent) {
+        $output = $serverList | Select-Object Server -Unique
+      }
+      else {
+        $output = $serverList | Select-Object Server
+      }
+    }
+    else {
+      if($unique.IsPresent) {
+        $output = $serverList | Where-Object {$_.Group -eq $null} | Select-Object Server -Unique
+      }
+      else {
+        $output = $serverList | Where-Object {$_.Group -eq $null} | Select-Object Server
+      }
+    }
+  }
+  
+  #Convert the output a string array
+  [string[]]$outputArray = $null
+  $output | ForEach-Object {$outputArray += $_.Server}
+  Write-Output $outputArray
+} #Get-CmsServer
+
+function Get-SqlUpTime {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $server = Get-SqlConnection $targetServer
+
+    #Get startup time
+
+    $cmd = "SELECT sqlserver_start_time FROM sys.dm_os_sys_info;"
+    $cmdv = "SELECT @@VERSION;"
+
+$cmdchk = "
+SET NOCOUNT ON;
+
+-- Declare variables
+DECLARE @MachineIdentification varchar(128) = '';
+DECLARE @ProductVersion varchar(20) = '';
+DECLARE @ProductBuild int = 0;
+DECLARE @PatchStatus varchar(15) = 'not patched';
+DECLARE @FinalPatchMessage varchar(256) = '';
+
+SET @MachineIdentification = 'Server Name = ' + CONVERT(varchar(50), SERVERPROPERTY ('MachineName')) + ', Instance Name = ' + ISNULL(CONVERT(varchar(50), SERVERPROPERTY('InstanceName')), 'None') + ': ';
+
+-- Figure out major version number and then get the build number
+ SET @ProductVersion = CONVERT(varchar(20), SERVERPROPERTY('ProductVersion'));
+ SET @ProductBuild = CONVERT(int, SERVERPROPERTY('ProductBuild'));
+
+
+-- SQL Server 2008
+ IF @ProductVersion LIKE '10.0%'
+	BEGIN
+		IF @ProductVersion = '10.0.6556.0'
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage =  'SQL Server 2008 '  + '. This SQL Server instance is ' + @PatchStatus + ' against Spectre/Meltdown.';	
+	END
+
+-- Description of the security update for SQL Server 2008 SP4 GDR: January 6, 2018
+-- https://support.microsoft.com/en-us/help/4057114
+-- Build 10.0.6556.0
+
+
+-- SQL Server 2008 R2
+IF @ProductVersion LIKE '10.5%'
+	BEGIN
+		IF @ProductVersion = '10.50.6560.0'
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage =  'SQL Server 2008 R2 '  + '. This SQL Server instance is ' + @PatchStatus + ' against Spectre/Meltdown.';
+	END
+
+
+-- Description of the security update for SQL Server 2008 R2 SP3 GDR: January 6, 2018
+-- https://support.microsoft.com/en-us/help/4057113
+-- 10.50.6560.0 
+
+
+-- SQL Server 2012 
+-- We have ProductBuild in SQL Server 2012 and newer
+IF @ProductVersion LIKE '11%'
+	BEGIN
+		IF @ProductBuild >= 7462
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage = 'SQL Server 2012 ' + '. This SQL Server instance is ' + @PatchStatus + + ' against Spectre/Meltdown.';
+	END
+
+-- Description of the security update for SQL Server 2012 SP4 GDR: January 12, 2018
+-- https://support.microsoft.com/en-us/help/4057116
+-- Build 11.0.7462.6
+
+
+-- SQL Server 2014
+IF @ProductVersion LIKE '12%'
+	BEGIN
+		IF @ProductBuild >= 5571 -- SP2 CU10
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 5214 -- SP2 GDR
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage = 'SQL Server 2014 ' + '. This SQL Server instance is ' + @PatchStatus + + ' against Spectre/Meltdown.';
+	END
+
+-- Description of the security update for SQL Server 2014 SP2 CU10: January 16, 2018
+-- https://support.microsoft.com/en-us/help/4057117
+-- Build 12.0.5571.0
+
+-- Description of the security update for SQL Server 2014 SP2 GDR: January 16, 2018
+-- https://support.microsoft.com/en-us/help/4057120
+-- Build 12.0.5214.6
+
+
+-- SQL Server 2016
+IF @ProductVersion LIKE '13%'
+	BEGIN
+		IF @ProductBuild >= 4466 -- SP1 CU7
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 4210  -- SP1 GDR
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 2218  -- RTM CU
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 1745  -- RTM GDR
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage = 'SQL Server 2016 ' + '. This SQL Server instance is ' + @PatchStatus + + ' against Spectre/Meltdown.';
+	END
+
+-- Description of the security update for SQL Server 2016 CU7 SP1: January 3, 2018
+-- https://support.microsoft.com/en-us/help/4058561
+-- Build 13.0.4466.4
+ 
+-- Description of the security update for SQL Server 2016 GDR SP1: January 3, 2018 
+-- https://support.microsoft.com/en-us/help/4057118
+-- Build 13.0.4210.6
+
+-- Description of the security update for SQL Server 2016 CU: January 6, 2018
+-- https://support.microsoft.com/en-us/help/4058559
+-- Build 13.0.2218.0 
+
+-- Description of the security update for SQL Server 2016 GDR: January 6, 2018
+-- https://support.microsoft.com/en-us/help/4058560
+-- Build 13.0.1745.2 
+
+
+-- SQL Server 2017
+IF @ProductVersion LIKE '14%'
+	BEGIN
+		IF @ProductBuild >= 3015 -- 2017 CU3
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 2000  -- 2017 GDR
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage = 'SQL Server 2017 '  + '. This SQL Server instance is ' + @PatchStatus + + ' against Spectre/Meltdown.';
+	END
+
+-- Description of the security update for SQL Server 2017 GDR: January 3, 2018
+-- https://support.microsoft.com/en-us/help/4057122
+-- Build 14.0.2000.63
+ 
+-- Description of the security update for SQL Server 2017 CU3 RTM: January 3, 2018
+-- https://support.microsoft.com/en-us/help/4058562
+-- Build 14.0.3015.40 
+
+-- SQL Server 2019
+IF @ProductVersion LIKE '15%'
+	BEGIN	
+		SET @PatchStatus = 'patched';	
+		SET @FinalPatchMessage = 'SQL Server 2019 ' + '. This SQL Server instance is ' + @PatchStatus + + ' against Spectre/Meltdown.';
+	END
+
+PRINT @FinalPatchMessage;
+SELECT @FinalPatchMessage AS [SQL Server Patch Status];
+"
+
+    try {
+        $sqlStartupTime = $server.ExecuteScalar($cmd)
+        $sqlVer = $server.ExecuteScalar($cmdv)
+$sqlchk = $server.ExecuteScalar($cmdchk)
+
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    $upTime = (New-TimeSpan -Start ($sqlStartupTime) -End ($script:startTime))
+
+    #Display the results to the console
+    if ($upTime.Days -eq 0 -and $upTime.Hours -le 6) {
+        #Critical if uptime is less than 6 hours
+        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)" ">>>  >>  >  Uptime :: $($upTime.Days).$($upTime.Hours):$($upTime.Minutes):$($upTime.Seconds)"
+Write-Host " "
+        Write-Host "SQL Server Version: $($sqlVer)"
+Write-Host " "
+###        Write-Host "Uptime: $($upTime.Days).$($upTime.Hours):$($upTime.Minutes):$($upTime.Seconds)"
+    }
+    elseif ($upTime.Days -lt 1 -and $upTime.Hours -gt 6) {
+        #Warning if uptime less than 1 day but greater than 6 hours
+        Write-Host "`nWARNING:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)" ">>>  >>  >  Uptime :: $($upTime.Days).$($upTime.Hours):$($upTime.Minutes):$($upTime.Seconds)"
+Write-Host " "
+        Write-Host "SQL Server Version: $($sqlVer)"
+Write-Host " "
+###        Write-Host "Uptime: $($upTime.Days).$($upTime.Hours):$($upTime.Minutes):$($upTime.Seconds)"
+    }
+    else {
+        #Good if uptime is greater than 1 day
+        Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"  ">>>  >>  >  Uptime :: $($upTime.Days).$($upTime.Hours):$($upTime.Minutes):$($upTime.Seconds)"
+Write-Host " "
+Write-Host " "
+        Write-Host "SQL Server Version: $($sqlVer)"
+Write-Host " "
+#Write-Host "# Spectre/Meltdown Check :: " -BackgroundColor Red -ForegroundColor Yellow -NoNewline;  Write-Host " $($sqlchk) " -BackgroundColor Red -ForegroundColor White -NoNewline;
+#Write-Host " "
+
+###        Write-Host "Uptime :#: $($upTime.Days).$($upTime.Hours):$($upTime.Minutes):$($upTime.Seconds)"
+    }
+
+} #Get-SqlUptime
+
+
+function Get-SqlUptime2 {
+    [CmdletBinding()]
+    param (
+        [Parameter(Position=0, Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$targetServer
+    )
+
+    # Establish connection to the SQL Server
+    try {
+        $server = Get-SqlConnection $targetServer
+    }
+    catch {
+        Write-Error "Failed to establish connection to the SQL Server: $_"
+        return
+    }
+
+    # SQL query to retrieve server hardware and SQL Server startup time
+    $sqlQuery = @"
+    SELECT cpu_count AS [Logical CPU Count],
+           hyperthread_ratio AS [Hyperthread Ratio],
+           cpu_count / hyperthread_ratio AS [Physical CPU],
+           physical_memory_kb / 1024 AS [Physical Memory (MB)],
+           Affinity_Type_Desc,
+           Virtual_Machine_Type_Desc,
+           Sqlserver_Start_Time
+    FROM sys.dm_os_sys_info OPTION (RECOMPILE);
+"@
+
+    # Execute the SQL query
+    try {
+        $results = $server.ExecuteWithResults($sqlQuery)
+    }
+    catch {
+        Write-Error "Failed to execute SQL query: $_"
+        return
+    }
+
+    # Display the results
+# Check if query returned results
+    if ($results.Tables.Count -gt 0 -and $results.Tables[0].Rows.Count -gt 0) {
+#        Write-Host "`nServer Hardware Information for $($server.TrueName):"
+        # Display query results
+        $results.Tables[0] | Select-Object 'Logical CPU Count', 'Hyperthread Ratio', 'Physical CPU', 'Physical Memory (MB)', 'Affinity_Type_Desc', 'Virtual_Machine_Type_Desc', 'Sqlserver_Start_Time' | Format-Table -AutoSize
+
+    }
+    else {
+        Write-Host "`nCRITICAL: $($server.TrueName) - No Server Hardware Report Available."
+    }
+}#Get-SqlUptime2
+
+
+########
+
+function Get-SqlUptime3 {
+    [CmdletBinding()]
+    param (
+        [Parameter(Position=0, Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$targetServer
+    )
+
+    # Establish connection to the SQL Server
+    try {
+        $server = Get-SqlConnection $targetServer
+    }
+    catch {
+        Write-Error "Failed to establish connection to the SQL Server: $_"
+        return
+    }
+
+    # SQL query to retrieve server hardware and SQL Server startup time
+
+    $sqlQuery3 = @"
+DECLARE @sqlmajorver int, @systemmem int, @systemfreemem int, @maxservermem int, @numa_nodes_afinned int, @numa int
+DECLARE @mwthreads_count int, @mwthreads int, @arch smallint, @sqlcmd nvarchar(4000)
+DECLARE @MinMBMemoryForOS INT, @RecommendedMaxMemMB INT
+SET @sqlmajorver = CONVERT(int, (@@microsoftversion / 0x1000000) & 0xff);
+SET @arch = CASE WHEN @@VERSION LIKE '%<X64>%' THEN 64 WHEN @@VERSION LIKE '%<IA64>%' THEN 128 ELSE 32 END;
+ 
+SELECT @maxservermem = CONVERT(int, [value]) FROM sys.configurations (NOLOCK) WHERE [Name] = 'max server memory (MB)';
+SELECT @numa_nodes_afinned = COUNT (DISTINCT parent_node_id) FROM sys.dm_os_schedulers WHERE scheduler_id < 255 AND parent_node_id < 64 AND is_online = 1
+SELECT @numa = COUNT(DISTINCT parent_node_id) FROM sys.dm_os_schedulers WHERE scheduler_id < 255 AND parent_node_id < 64;
+SELECT @mwthreads = CONVERT(int, [value]) FROM sys.configurations WHERE [Name] = 'max worker threads'
+SELECT @mwthreads_count = max_workers_count FROM sys.dm_os_sys_info;
+ 
+IF @sqlmajorver = 9
+BEGIN
+	SET @sqlcmd = N'SELECT @systemmemOUT = t1.record.value(''(./Record/MemoryRecord/TotalPhysicalMemory)[1]'', ''bigint'')/1024, 
+	@systemfreememOUT = t1.record.value(''(./Record/MemoryRecord/AvailablePhysicalMemory)[1]'', ''bigint'')/1024
+FROM (SELECT MAX([TIMESTAMP]) AS [TIMESTAMP], CONVERT(xml, record) AS record 
+	FROM sys.dm_os_ring_buffers (NOLOCK)
+	WHERE ring_buffer_type = N''RING_BUFFER_RESOURCE_MONITOR''
+		AND record LIKE ''%RESOURCE_MEMPHYSICAL%''
+	GROUP BY record) AS t1';
+END
+ELSE
+BEGIN
+	SET @sqlcmd = N'SELECT @systemmemOUT = total_physical_memory_kb/1024, @systemfreememOUT = available_physical_memory_kb/1024 FROM sys.dm_os_sys_memory';
+END
+EXECUTE sp_executesql @sqlcmd, N'@systemmemOUT bigint OUTPUT, @systemfreememOUT bigint OUTPUT', @systemmemOUT=@systemmem OUTPUT, @systemfreememOUT=@systemfreemem OUTPUT;
+ 
+SET @MinMBMemoryForOS = CASE WHEN @systemmem <= 2048 THEN 512
+		WHEN @systemmem BETWEEN 2049 AND 4096 THEN 819
+		WHEN @systemmem BETWEEN 4097 AND 8192 THEN 1228
+		WHEN @systemmem BETWEEN 8193 AND 12288 THEN 2048
+		WHEN @systemmem BETWEEN 12289 AND 24576 THEN 2560
+		WHEN @systemmem BETWEEN 24577 AND 32768 THEN 3072
+		WHEN @systemmem > 32768 THEN 4096
+	END
+SET @RecommendedMaxMemMB = @systemmem-@MinMBMemoryForOS-(@mwthreads_count*(CASE WHEN @arch = 64 THEN 2 WHEN @arch = 128 THEN 4 WHEN @arch = 32 THEN 0.5 END)-256)
+SELECT
+	  CurrentMaxMemorySettingMB = @maxservermem
+	, ServerTotalMemoryMB		= @systemmem
+	, MinMemoryForOSMB			= @MinMBMemoryForOS
+	, RecommendedMaxMemForSingleNumaMB		= @RecommendedMaxMemMB
+	, NumaNodes					= @numa
+	, NumaNodesAfinned			= @numa_nodes_afinned
+"@
+
+    # Execute the SQL query
+    try {
+        $results = $server.ExecuteWithResults($sqlQuery3)
+    }
+    catch {
+        Write-Error "Failed to execute SQL query: $_"
+        return
+    }
+
+    # Display the results
+# Check if query returned results
+    if ($results.Tables.Count -gt 0 -and $results.Tables[0].Rows.Count -gt 0) {
+#        Write-Host "`nServer Hardware Information for $($server.TrueName):"
+        # Display query results
+        $results.Tables[0] | Select-Object CurrentMaxMemorySettingMB, ServerTotalMemoryMB, MinMemoryForOSMB, RecommendedMaxMemForSingleNumaMB, NumaNodes, NumaNodesAfinned | Format-Table -AutoSize
+
+    }
+    else {
+        Write-Host "`nCRITICAL: $($server.TrueName) - No Server Hardware Report Available."
+    }
+}#Get-SqlUptime3
+#############
+function Get-DatabaseStatus {
+    Param (
+        [CmdletBinding()]
+        [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    # Get status of each database
+    $server = Get-SqlConnection $targetServer
+
+    $cmd = @"
+	SELECT [name] AS [database_name], state_desc FROM sys.databases d
+        JOIN sys.database_mirroring dm ON d.database_id = dm.database_id
+        WHERE dm.mirroring_role_desc <> 'MIRROR'
+        OR dm.mirroring_role_desc IS NULL;
+"@
+
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    # Count of databases in each state
+    $criticalCount = ($results.Tables[0] | Where-Object {$_.state_desc -eq 'SUSPECT'}).Count
+    $warningCount = ($results.Tables[0] | Where-Object {$_.state_desc -in 'RESTORING','RECOVERING','RECOVERY_PENDING','EMERGENCY','OFFLINE','COPYING','OFFLINE_SECONDARY'}).Count
+    $goodCount = ($results.Tables[0] | Where-Object {$_.state_desc -notin 'SUSPECT','RESTORING','RECOVERING','RECOVERY_PENDING','EMERGENCY','OFFLINE','COPYING','OFFLINE_SECONDARY'}).Count
+
+    # Display the results to the console
+    if ($criticalCount -gt 0) {
+        Write-Host "`nCRITICAL ($criticalCount databases):" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+    }
+    elseif ($warningCount -gt 0) {
+        Write-Host "`nWARNING ($warningCount databases):" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+    }
+    else {
+        Write-Host "`nGOOD ($goodCount databases):" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+Write-Host " "
+Write-Host " ALL Database are Online and Healthy !!! "
+#Write-Host "`nGOOD ($goodCount databases):" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+    }
+
+    # Display detailed information about databases in certain states
+    $results.Tables[0] | Where-Object {$_.state_desc -in 'SUSPECT','RESTORING','RECOVERING','RECOVERY_PENDING','EMERGENCY','OFFLINE','COPYING','OFFLINE_SECONDARY'} | Select-Object database_name,state_desc | Format-Table -AutoSize
+}
+
+#Get-DatabaseStatus
+
+function Get-AGStatus {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $server = Get-SqlConnection $targetServer
+
+    $cmd = @"
+    SELECT 
+	     ag.name AS ag_name
+	    ,ar.replica_server_name
+	    ,ars.role_desc AS role
+	    ,ar.availability_mode_desc
+	    ,ar.failover_mode_desc
+	    ,adc.[database_name]
+	    ,drs.synchronization_state_desc AS synchronization_state
+	    ,drs.synchronization_health_desc AS synchronization_health
+    FROM sys.dm_hadr_database_replica_states AS drs WITH (NOLOCK)
+    INNER JOIN sys.availability_databases_cluster AS adc WITH (NOLOCK) ON drs.group_id = adc.group_id AND drs.group_database_id = adc.group_database_id
+    INNER JOIN sys.availability_groups AS ag WITH (NOLOCK) ON ag.group_id = drs.group_id
+    INNER JOIN sys.availability_replicas AS ar WITH (NOLOCK) ON drs.group_id = ar.group_id AND drs.replica_id = ar.replica_id
+    INNER JOIN sys.dm_hadr_availability_replica_states AS ars ON ar.replica_id = ars.replica_id
+    WHERE ars.is_local = 1
+    ORDER BY ag.name, ar.replica_server_name, adc.[database_name] OPTION (RECOMPILE);
+"@
+
+    #If one exists, get status of each Availability Group
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0].Rows.Count -ne 0) {
+        if ($results.Tables[0] | Where-Object {$_.synchronization_health -ne 'HEALTHY'}) {
+            if ($_.synchronization_health -eq 'NOT_HEALTHY') {
+                Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+            }
+            elseif ($_.synchronization_health -eq 'PARTIALLY_HEALTHY') {
+                Write-Host "`nWARNING:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+            }
+        }
+        else {
+            Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+        }
+
+        $results.Tables[0] | Where-Object {$_.synchronization_health -in 'NOT_HEALTHY','PARTIALLY_HEALTHY' } | Select-Object replica_server_name,ag_name,role,database_name,synchronization_state,synchronization_health | Format-Table -AutoSize
+
+$results.Tables[0] | Where-Object {$_.synchronization_health -in 'HEALTHY' } | Select-Object ag_name, role, database_name, availability_mode_desc, failover_mode_desc, synchronization_state, synchronization_health | Format-Table -AutoSize
+
+   }
+    else {
+      Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+Write-Host " "
+      Write-Host '*** No Availabiliy Groups detected ***'
+    }
+
+} #Get-AGStatus
+
+function Get-DatabaseBackupStatus {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    #Get status of each database
+    $server = Get-SqlConnection $targetServer
+
+    $cmdbak = @"
+    SELECT 
+	     name AS [database_name]
+	    ,recovery_model_desc
+	    ,[D] AS last_full_backup
+	    ,[I] AS last_differential_backup
+	    ,[L] AS last_tlog_backup
+	    ,CASE	    
+/* These conditions below will cause a CRITICAL status */
+		    WHEN [D] IS NULL THEN 'CRITICAL'															
+-- if last_full_backup is null then critical
+		    WHEN [D] < DATEADD(DD,-1,CURRENT_TIMESTAMP) AND [I] IS NULL THEN 'CRITICAL'								
+-- if last_full_backup is more than 2 days old and last_differential_backup is null then critical
+		    WHEN [D] < DATEADD(DD,-7,CURRENT_TIMESTAMP) AND [I] < DATEADD(DD,-2,CURRENT_TIMESTAMP) THEN 'CRITICAL'				
+-- if last_full_backup is more than 7 days old and last_differential_backup more than 2 days old then critical
+		    WHEN recovery_model_desc <> 'SIMPLE' AND name <> 'model' AND [L] IS NULL THEN 'CRITICAL'	
+-- if recovery_model_desc is SIMPLE and last_tlog_backup is null then critical
+		    WHEN recovery_model_desc <> 'SIMPLE' AND name <> 'model' AND [L] < DATEADD(HH,-6,CURRENT_TIMESTAMP) THEN 'CRITICAL'		
+-- if last_tlog_backup is more than 6 hours old then critical
+		    --/* These conditions below will cause a WARNING status */
+		    WHEN [D] < DATEADD(DD,-1,CURRENT_TIMESTAMP) AND [I] < DATEADD(DD,-1,CURRENT_TIMESTAMP) THEN 'WARNING'		
+-- if last_full_backup is more than 1 day old and last_differential_backup is greater than 1 days old then warning
+		    WHEN recovery_model_desc <> 'SIMPLE' AND name <> 'model' AND [L] < DATEADD(HH,-3,CURRENT_TIMESTAMP) THEN 'WARNING'		
+-- if last_tlog_backup is more than 3 hours old then warning
+            /* Everything else will return a GOOD status */
+		    ELSE 'GOOD'
+	     END AS backup_status
+	    ,CASE
+		    /* These conditions below will cause a CRITICAL status */
+		    WHEN [D] IS NULL THEN 'No FULL backups'															
+-- if last_full_backup is null then critical
+		    WHEN [D] < DATEADD(DD,-1,CURRENT_TIMESTAMP) AND [I] IS NULL THEN 'FULL backup > 1 day; no DIFF backups'			
+-- if last_full_backup is more than 2 days old and last_differential_backup is null then critical
+		    WHEN [D] < DATEADD(DD,-7,CURRENT_TIMESTAMP) AND [I] < DATEADD(DD,-2,CURRENT_TIMESTAMP) THEN 'FULL backup > 7 day; DIFF backup > 2 days'	
+-- if last_full_backup is more than 7 days old and last_differential_backup more than 2 days old then critical
+		    WHEN recovery_model_desc <> 'SIMPLE' AND name <> 'model' AND [L] IS NULL THEN 'No LOG backups'	
+-- if recovery_model_desc is SIMPLE and last_tlog_backup is null then critical
+		    WHEN recovery_model_desc <> 'SIMPLE' AND name <> 'model' AND [L] < DATEADD(HH,-6,CURRENT_TIMESTAMP) THEN 'LOG backup > 6 hours'		
+-- if last_tlog_backup is more than 6 hours old then critical
+		    --/* These conditions below will cause a WARNING status */
+		    WHEN [D] < DATEADD(DD,-1,CURRENT_TIMESTAMP) AND [I] < DATEADD(DD,-1,CURRENT_TIMESTAMP) THEN 'FULL backup > 7 day; DIFF backup > 1 day'		
+-- if last_full_backup is more than 1 day old and last_differential_backup is greater than 1 days old then warning
+		    WHEN recovery_model_desc <> 'SIMPLE' AND name <> 'model' AND [L] < DATEADD(HH,-3,CURRENT_TIMESTAMP) THEN 'LOG backup > 3 hours'		
+-- if last_tlog_backup is more than 3 hours old then warning
+            /* Everything else will return a GOOD status */
+		    ELSE 'No issues'
+	     END AS status_desc
+    FROM (
+	    SELECT
+		     d.name
+		    ,d.recovery_model_desc
+		    ,bs.type
+		    ,MAX(bs.backup_finish_date) AS backup_finish_date
+	    FROM master.sys.databases d
+	    LEFT JOIN msdb.dbo.backupset bs ON d.name = bs.database_name
+	    WHERE (bs.type IN ('D','I','L') OR bs.type IS NULL)
+	    AND d.database_id <> 2				-- exclude tempdb
+	    AND d.source_database_id IS NULL	-- exclude snapshot databases
+	    AND d.state NOT IN (1,6,10)			-- exclude offline, restoring, or secondary databases
+	    AND d.is_in_standby = 0				-- exclude log shipping secondary databases
+	    GROUP BY d.name, d.recovery_model_desc, bs.type
+    ) AS SourceTable  
+    PIVOT  
+    (
+	    MAX(backup_finish_date)
+	    FOR type IN ([D],[I],[L])  
+    ) AS PivotTable
+    ORDER BY database_name;
+"@
+    
+    try {
+        $results = $server.ExecuteWithResults($cmdbak)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0] | Where-Object {$_.backup_status -eq 'CRITICAL'}) {
+        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+    }
+    elseif ($results.Tables[0] | Where-Object {$_.backup_status -eq 'WARNING'}) {
+        Write-Host "`nWARNING:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+    }
+    else {
+        Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+    }
+
+    $results.Tables[0] | Where-Object {$_.backup_status -in 'CRITICAL','WARNING'} | Select-Object database_name,recovery_model_desc,backup_status,status_desc | Format-Table -AutoSize
+
+} #Get-DatabaseBackupStatus
+
+function Get-DiskSpace {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $server = Get-SqlConnection $targetServer
+
+    $cmd = @"
+    SELECT DISTINCT 
+         vs.volume_mount_point
+        ,vs.logical_volume_name
+        ,CONVERT(DECIMAL(18,2), vs.total_bytes/1073741824.0) AS total_size_gb
+        ,CONVERT(DECIMAL(18,2), vs.available_bytes/1073741824.0) AS available_size_gb
+        ,CONVERT(DECIMAL(18,2), vs.available_bytes * 1. / vs.total_bytes * 100.) AS free_space_pct
+    FROM sys.master_files AS f WITH (NOLOCK)
+    CROSS APPLY sys.dm_os_volume_stats(f.database_id, f.[file_id]) AS vs 
+    ORDER BY vs.volume_mount_point OPTION (RECOMPILE);
+"@
+
+    #Get disk space and store it in the repository
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0] | Where-Object {$_.free_space_pct -lt 10.0}) {
+        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+    }
+    elseif ($results.Tables[0] | Where-Object {$_.free_space_pct -lt 20.0 -and $_.free_space_pct -gt 10.0}) {
+        Write-Host "`nWARNING:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+    }
+    else { Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)" }
+
+    $results.Tables[0] | Where-Object {$_.free_space_pct -lt 20.0} | Select-Object volume_mount_point,total_size_gb,available_size_gb,free_space_pct | Format-Table -AutoSize
+} #Get-DiskSpace
+
+function Get-FailedJobs {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $server = Get-SqlConnection $targetServer
+
+    $cmd = @"
+    SELECT 
+	    j.name AS job_name
+	    ,CASE
+		    WHEN a.start_execution_date IS NULL THEN 'Not Running'
+		    WHEN a.start_execution_date IS NOT NULL AND a.stop_execution_date IS NULL THEN 'Running'
+		    WHEN a.start_execution_date IS NOT NULL AND a.stop_execution_date IS NOT NULL THEN 'Not Running'
+	        END AS 'current_run_status'
+	    ,a.start_execution_date AS 'last_start_date'
+	    ,a.stop_execution_date AS 'last_stop_date'
+	    ,CASE h.run_status
+		    WHEN 0 THEN 'Failed'
+		    WHEN 1 THEN 'Succeeded'
+		    WHEN 2 THEN 'Retry'
+		    WHEN 3 THEN 'Canceled'
+	        END AS 'last_run_status'
+	    ,h.message AS 'job_output'
+    FROM msdb.dbo.sysjobs j
+    INNER JOIN msdb.dbo.sysjobactivity a ON j.job_id = a.job_id
+    LEFT JOIN msdb.dbo.sysjobhistory h ON a.job_history_id = h.instance_id
+    WHERE a.session_id = (SELECT MAX(session_id) FROM msdb.dbo.sysjobactivity)
+		AND j.enabled = 1
+    ORDER BY j.name;
+"@
+
+    #Get the failed jobs and store it in the repository
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0] | Where-Object {$_.last_run_status -eq 'Failed'}) {
+        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+    }
+    elseif ($results.Tables[0] | Where-Object {$_.last_run_status -in 'Retry','Canceled'}) {
+        Write-Host "`nWARNING:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+    }
+    else {
+      Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+    }
+
+    $results.Tables[0] | Where-Object {$_.last_run_status -in 'Failed','Retry','Canceled'} | Select-Object job_name,current_run_status,last_run_status,last_stop_date | Format-Table -AutoSize
+} #Get-FailedJobs
+
+function Get-AppLogEvents {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    <#
+      NOTE: If SQL is using the "-n" startup paramenter, then SQL does not 
+      write to the Windows Application log, and this will always return no errors.
+      https://docs.microsoft.com/en-us/sql/database-engine/configure-windows/database-engine-service-startup-options
+    #>
+
+    #Get the physical hostname
+    $server = Get-SqlConnection $targetServer
+
+    if($server.TrueName.Split('\')[1]) {
+        $source = "MSSQL`$$($server.TrueName.Split('\')[1])"
+    }
+    else {
+        $source = 'MSSQLSERVER'
+    }
+
+    $cmd = "SELECT SERVERPROPERTY('ComputerNamePhysicalNetBIOS');"
+    try {
+        $computerName = $server.ExecuteScalar($cmd)
+    }
+    catch {
+        Get-Error $_
+    }
+    
+    #ErrorAction = SilentlyConintue to prevent "No events were found"
+    $events = $null
+    $events = Get-WinEvent -ComputerName $computerName -FilterHashtable @{LogName='Application';Level=2;StartTime=((Get-Date).AddDays(-1));ProviderName=$source} -ErrorAction SilentlyContinue
+
+    if ($events) {
+        #Display the results to the console
+        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+        Write-Host "Found $($events.Count) error(s)! Showing only the most recent events:"
+        $events | Select-Object TimeCreated,@{Label='EventID';Expression={$_.Id}},Message | Format-Table -AutoSize
+    }
+    else { Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)" }
+} #Get-AppLogEvents
+
+
+function Get-ServiceStatus {
+    Param (
+        [CmdletBinding()]
+        [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $cmd = "SELECT servicename,CASE SERVERPROPERTY('IsClustered') WHEN 0 THEN startup_type_desc WHEN 1 THEN 'Automatic' END AS startup_type_desc,status_desc FROM sys.dm_server_services;"
+
+    # Get status of each SQL service
+    $server = Get-SqlConnection $targetServer
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    # Display all services to the console
+    Write-Host "`nAll Services on $($server.TrueName):"
+    $results.Tables[0] | ForEach-Object {
+        Write-Host "$($_.servicename): $($_.status_desc), Startup Type: $($_.startup_type_desc)"
+    }
+
+    # Display the results to the console
+    $criticalServices = $results.Tables[0] | Where-Object { $_.status_desc -ne 'Running' -and $_.startup_type_desc -eq 'Automatic' }
+    $manualStoppedServices = $results.Tables[0] | Where-Object { $_.status_desc -eq 'Stopped' -and $_.startup_type_desc -eq 'Manual' }
+
+    if ($criticalServices) {
+Write-Host " "
+        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+        $criticalServices | ForEach-Object {
+            Write-Host "$($_.servicename): $($_.status_desc), Startup Type: $($_.startup_type_desc)"
+Write-Host " "
+        }
+    }
+    else {
+Write-Host " "
+        Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+Write-Host " "
+    }
+
+    # Display services set to manual and stopped
+    if ($manualStoppedServices) {
+        Write-Host "`nManual and Stopped Services:" -BackgroundColor Red -ForegroundColor White
+        $manualStoppedServices | ForEach-Object {
+            Write-Host "$($_.servicename): $($_.status_desc), Startup Type: $($_.startup_type_desc)"
+        }
+    }
+} #Get-ServiceStatus
+
+function Get-ClusterStatus {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $cmd = @"
+    SELECT
+         NodeName AS cluster_node_name
+        ,UPPER(status_description) AS cluster_node_status
+    FROM sys.dm_os_cluster_nodes
+    UNION
+    SELECT
+         member_name AS cluster_node_name
+        ,member_state_desc AS cluster_node_status
+    FROM sys.dm_hadr_cluster_members
+    WHERE member_type = 0;
+"@
+
+    #If one exists, get status of each Availability Group
+    $server = Get-SqlConnection $targetServer
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0].Rows.Count -ne 0) {
+        if ($results.Tables[0] | Where-Object {$_.cluster_node_status -ne 'UP'}) {
+            Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+        }
+        else { Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)" }
+$results.Tables[0] | Select-Object cluster_node_name, cluster_node_status | Format-Table -AutoSize
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0] | Where-Object {$_.cluster_node_status -ne 'UP'}) {
+        $results.Tables[0] | ForEach-Object {
+            if ($_.cluster_node_status -ne 'UP') {
+                Write-Host "$($_.cluster_node_name): $($_.cluster_node_status)" -BackgroundColor Red -ForegroundColor White
+            }
+            else {
+                Write-Host "$($_.cluster_node_name): $($_.cluster_node_status)"
+            }
+        }
+    }
+    if ($results.Tables[0].Rows.Count -eq 0) {
+      Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+Write-Host " "
+      Write-Host '*** No cluster detected ***'
+    }
+} #Get-ClusterStatus
+
+##KC
+
+function Get-LongRunSQL {
+    Param (
+        [CmdletBinding()]
+        [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    # Get status of each database
+    $server = Get-SqlConnection $targetServer
+
+    $longRunningQueryCmd = @"
+SELECT 
+    r.session_id,
+    r.start_time,
+    s.program_name,
+    r.status,
+    r.command,
+    r.wait_type,
+    r.last_wait_type,
+    r.wait_time,
+    r.cpu_time,
+    r.total_elapsed_time,
+    r.percent_complete,
+    t.text AS [SQL Text]
+FROM 
+    sys.dm_exec_requests r
+JOIN 
+    sys.dm_exec_sessions s ON r.session_id = s.session_id
+CROSS APPLY 
+    sys.dm_exec_sql_text(r.sql_handle) t
+WHERE 
+    r.total_elapsed_time > 86400000 -- Total elapsed time greater than 24 hours (in milliseconds)
+ORDER BY 
+    r.total_elapsed_time DESC;
+"@
+
+$executionPlanCmd = @"
+
+SELECT TOP(5)
+    --DB_NAME(t.dbid) AS [Database Name],
+    qs.execution_count AS [Execution Count],
+    qs.total_logical_reads AS [Total Logical Reads],
+    qs.total_worker_time AS [Total Worker Time],
+    qs.total_elapsed_time AS [Total Elapsed Time],
+    qs.creation_time AS [Creation Time],
+    t.text AS [Complete Query Text]
+FROM 
+    sys.dm_exec_query_stats AS qs WITH (NOLOCK)
+CROSS APPLY 
+    sys.dm_exec_sql_text(plan_handle) AS t
+WHERE 
+    t.dbid = DB_ID()
+ORDER BY 
+    [Total Elapsed Time] DESC
+OPTION 
+    (RECOMPILE);
+"@
+
+$currentexecCmd = @"
+SELECT 
+DB_NAME(r.database_id) AS [Database Name],
+    r.session_id AS [Session ID],
+    r.total_elapsed_time/1000 AS ElapsedTimeSeconds,
+    s.host_name AS [Host Name],
+    s.login_name AS [Login Name],
+    --s.open_transaction_count AS [Open Trans],
+    r.start_time AS [Start Time],
+    r.status AS [Status],
+    r.command AS [Command],
+    r.blocking_session_id AS [Blocking Session],
+    --r.language,
+    r.logical_reads,
+    --r.writes,
+    r.cpu_time AS [CPU Time],
+    --p.usecounts AS PlanUseCount,
+    r.wait_time,
+    r.wait_type,
+    [sql].[text]
+    --,    pl.query_plan AS [Plan]
+FROM   
+    sys.dm_exec_requests r --Status info
+    INNER JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id --Session (User info)
+    INNER JOIN sys.dm_exec_cached_plans p ON p.plan_handle = r.plan_handle
+    --CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) AS pl
+    CROSS APPLY sys.dm_exec_sql_text(r.plan_handle) AS [sql]
+WHERE   
+    r.[status] IN ('Suspended','Runnable','Running','Pending')   
+ORDER BY r.total_elapsed_time DESC ;
+
+"@
+
+    try {
+        $longRunningQueries = $server.ExecuteWithResults($longRunningQueryCmd)
+        $executionPlans = $server.ExecuteWithResults($executionPlanCmd)
+$currentexecPlans = $server.ExecuteWithResults($currentexecCmd)
+    }
+    catch {
+        Write-Error "Error executing SQL query: $_"
+        return
+    }
+
+    # Display the results to the console
+    if ($longRunningQueries.Tables[0].Rows.Count -gt 0) {
+        Write-Host "`nLong Running Queries > 24 hours ($($longRunningQueries.Tables[0].Rows.Count)):" -BackgroundColor Red -ForegroundColor White
+        $longRunningQueries.Tables[0] | Format-Table -AutoSize -Property session_id, start_time, program_name, status, command, wait_type, last_wait_type, wait_time, cpu_time, total_elapsed_time, percent_complete, 'SQL Text'
+    }
+    else {
+        Write-Host "`nNo Long Running Queries found." -ForegroundColor Green
+    }
+
+    if ($executionPlans.Tables[0].Rows.Count -gt 0) {
+        Write-Host "`nTop 5 Long Running Query List < 24 hours:" -BackgroundColor Red -ForegroundColor White
+        $executionPlans.Tables[0] | Format-Table -AutoSize -Property 'Execution Count', 'Total Logical Reads', 'Total Worker Time', 'Total Elapsed Time', 'Creation Time', 'Complete Query Text'
+        Write-Host "`nCurrent Running Query Session:" -BackgroundColor Green -ForegroundColor Black
+        $currentexecPlans.Tables[0] | Format-Table -AutoSize -Property 'Database Name', 'Session ID', 'Host Name', 'Login Name', 'Open Trans', 'Start Time', 'Status', 'Blocking Session', 'CPU Time', 'Wait Time', 'Wait Type', 'SQL Text'
+    
+    }
+    else {
+        Write-Host "`nNo Long Running Query Execution Plans found." -ForegroundColor Green
+    }
+}
+
+# Example usage:
+# Get-LongRunSQL -targetServer "YourServerName"
+
+function Get-Errorlog {
+    Param (
+        [CmdletBinding()]
+        [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    # Get status of each database
+    $server = Get-SqlConnection $targetServer
+
+    $cmd = @"
+SET NOCOUNT ON;
+---------------------
+-- The following block parses error log and produces interesting results
+
+CREATE TABLE #ErrorLog ( 
+    LogDate DATETIME, 
+    ProcessInfo NVARCHAR(255), 
+    LogText NVARCHAR(MAX) 
+); 
+
+INSERT INTO #ErrorLog ( 
+    [LogDate], 
+    [ProcessInfo], 
+    [LogText] 
+) 
+EXEC xp_readerrorlog;
+
+SELECT LEFT(@@servername, 20) AS server, '|', LEFT(LogDate, 20) AS LogDate, '|', [LogText] 
+FROM #ErrorLog 
+WHERE LogText NOT LIKE 'Database backed up%'
+AND LogText NOT LIKE 'Log was backed up%'
+AND LogText NOT LIKE '%found 0 errors%'
+AND LogText NOT LIKE 'Configuration option ''user options'' changed from 0 to 0. Run the RECONFIGURE statement to install.'
+AND LogText NOT LIKE 'Microsoft SQL Server 200%'
+AND LogText NOT LIKE '(c) %'
+AND LogText NOT LIKE 'All rights rese%'
+AND LogText NOT LIKE 'Server process ID is%'
+AND LogText NOT LIKE 'System Manufacturer:%'
+AND LogText NOT LIKE 'Authentication mode is %'
+AND LogText NOT LIKE 'Logging SQL Server messages in file%'
+AND LogText NOT LIKE 'Registry startup parameters:%'
+AND LogText NOT LIKE 'SQL Server is starting at normal priority base%'
+AND LogText NOT LIKE 'Detected % CPUs. This is an informational messag%'
+AND LogText NOT LIKE 'Using locked pages for buffer pool%'
+AND LogText NOT LIKE 'Using dynamic lock allocation.%'
+AND LogText NOT LIKE 'Node configuration: node 0: CPU mask%'
+AND LogText NOT LIKE 'Setting database option COMPATIBILITY_LEVEL to 100%'
+AND LogText NOT LIKE 'Setting database option COMPATIBILITY_LEVEL to 100 for database ReportServerTempDB.'
+AND LogText NOT LIKE 'Server is listening on %'
+AND LogText NOT LIKE 'Server local connection provider is ready to accept connection on%'
+AND LogText NOT LIKE 'The SQL Server Network Interface library successfully registered the Service Principal Name%'
+AND LogText NOT LIKE 'Service Broker manager has started.'
+AND LogText NOT LIKE 'Starting up database%'
+AND LogText NOT LIKE 'CHECKDB for database % finished without errors on %'
+AND LogText NOT LIKE 'FILESTREAM: effective level = 0, configured level = 0%'
+AND LogText NOT LIKE 'AppDomain % unloaded.'
+AND LogText NOT LIKE 'I/O was resumed on database %'
+AND LogText NOT LIKE 'I/O is frozen on database %'
+AND LogText NOT LIKE 'Login failed for user %'
+AND LogText NOT LIKE 'Login succeeded for user %'
+AND LogText NOT LIKE 'Error: 18456, Severity: 14, State: 38.'
+AND LogText NOT LIKE 'BACKUP DATABASE successfully processed %'
+AND LogText NOT LIKE 'Database differential changes were backed up. %'
+AND LogText NOT LIKE 'BACKUP DATABASE WITH DIFFERENTIAL successfully %'
+AND LogText NOT LIKE 'The activated proc %'
+--change the 72 below to alter timeframe of log read.
+AND LogDate > DATEADD(hh, -24, GETDATE());  
+DROP TABLE #ErrorLog;
+"@
+
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    # Display the results to the console
+    $results.Tables[0] | Format-Table -AutoSize
+}
+
+if ($executionPlans.Tables[0].Rows.Count -gt 0) {
+        Write-Host "`nSQL Server ERROR Log  < 24 hours::" -BackgroundColor Red -ForegroundColor White
+    }
+    else {
+        Write-Host "`nNo SQL Server ERROR Log found." -ForegroundColor Green
+    }
+#}
+
+Write-Host "`nSQL Server ERROR Log  < 24 hours:" -BackgroundColor Red -ForegroundColor White
+#Get-Errorlog
+
+##KC
+
+function Get-SqlAudit {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+    $server = Get-SqlConnection $targetServer
+
+    $cmd = @"
+
+    /* Check SQL Logins for basic security measures */
+
+	IF OBJECT_ID('tempdb..#AuditResults') IS NOT NULL
+	BEGIN
+		DROP TABLE #AuditResults
+	END
+
+--Create results table
+CREATE TABLE #AuditResults
+							(	
+									ServerName sysname
+								,	InstanceName sysname
+								,	LoginName sysname
+								,	Issue varchar(200)
+								,	Importance int
+							);
+
+WITH SQLLoginChecks 
+AS
+(
+
+	SELECT	CAST(SERVERPROPERTY('machinename')as sysname) AS 'ServerName'
+		,	CAST(ISNULL(SERVERPROPERTY('instancename'), SERVERPROPERTY('machinename'))as sysname) AS 'InstanceName'
+		,	name AS LoginName
+		,	PWDCOMPARE(name, password_hash) AS PasswordEqualsName
+		,	is_policy_checked
+		,	is_expiration_checked 
+	FROM	master.sys.sql_logins
+	WHERE	PWDCOMPARE(name, password_hash) = 1
+			OR
+			is_policy_checked = 0
+			OR
+			is_expiration_checked = 0
+)
+
+	INSERT INTO #AuditResults
+	SELECT  CAST(ServerName as sysname) AS ServerName
+		,	CAST(InstanceName as sysname) AS InstanceName
+		,	LoginName
+		,	CASE
+				WHEN PasswordEqualsName = 1 AND is_policy_checked = 0 AND is_expiration_checked = 0 
+					THEN 'Login with PASSWORD EQUAL to login name, without CHECK_POLICY enabled and without CHECK_EXPIRATION enabled.'
+				WHEN PasswordEqualsName = 1 AND is_policy_checked = 0 
+					THEN 'Login with PASSWORD EQUAL to login name and without CHECK_POLICY enabled.'
+				WHEN PasswordEqualsName = 1 AND is_expiration_checked = 0
+					THEN 'Login with PASSWORD EQUAL to login name and without CHECK_EXPIRATION enabled.'
+				WHEN PasswordEqualsName = 1 
+					THEN 'Login with PASSWORD EQUAL to login name.'
+				WHEN is_policy_checked = 0 AND is_expiration_checked = 0
+					THEN 'Login without CHECK_POLICY enabled and without CHECK_EXPIRATION enabled.'
+				WHEN is_policy_checked = 0
+					THEN 'Login without CHECK_POLICY enabled.'
+				WHEN is_expiration_checked = 0
+					THEN 'Login without CHECK_EXPIRATION enabled.'
+			END As Issue
+		,	CASE
+				WHEN PasswordEqualsName = 1 AND is_policy_checked = 0 AND is_expiration_checked = 0 THEN 5000
+				WHEN PasswordEqualsName = 1 AND is_policy_checked = 0 THEN 3000
+				WHEN PasswordEqualsName = 1 AND is_expiration_checked = 0 THEN 2500
+				WHEN PasswordEqualsName = 1 THEN 2000
+				WHEN is_policy_checked = 0 AND is_expiration_checked = 0 THEN 1500
+				WHEN is_policy_checked = 0 THEN 1000
+				WHEN is_expiration_checked = 0 THEN 500
+			END As Importance
+				
+	FROM SQLLoginChecks
+	ORDER BY Importance DESC;
+
+/*
+--check for sysadmins
+https://msdn.microsoft.com/en-us/library/ms188772.aspx
+*/
+	IF OBJECT_ID('tempdb..#SysAdmins') IS NOT NULL
+	BEGIN
+		DROP TABLE #SysAdmins
+	END
+
+	CREATE TABLE #SysAdmins (
+									ServerRole SYSNAME
+								,	MemberName SYSNAME
+								,	MemberSID VARBINARY(85)
+							)
+
+	INSERT INTO #SysAdmins
+	EXEC sp_helpsrvrolemember 'sysadmin'
+
+	INSERT INTO #AuditResults
+	SELECT		CAST(SERVERPROPERTY('machinename')as sysname) AS 'ServerName'
+			,	CAST(ISNULL(SERVERPROPERTY('instancename'), SERVERPROPERTY('machinename'))as sysname) AS 'InstanceName'
+			,	MemberName AS	LoginName 
+			,	'The user has sysadmins role, this user can do anything.' AS	Issue 
+			,	400 AS	Importance 
+	FROM #SysAdmins
+	ORDER BY Importance DESC;
+
+/*
+Check for default service account
+*/
+
+	INSERT INTO #AuditResults
+	SELECT		CAST(SERVERPROPERTY('machinename')as sysname) AS 'ServerName'
+			,	CAST(ISNULL(SERVERPROPERTY('instancename'), SERVERPROPERTY('machinename'))as sysname) AS 'InstanceName'
+			,	service_account AS	LoginName 
+			,	'Default service account in use.' AS	Issue 
+			,	300 AS	Importance 
+	FROM	sys.dm_server_services
+	WHERE	service_account Like 'NT Service%' --'NT Service\MSSQLSERVER' etc for any service
+
+/*
+	Check login mode
+*/
+	IF OBJECT_ID('tempdb..#LoginConfig') IS NOT NULL
+	BEGIN
+		DROP TABLE #LoginConfig
+	END
+
+	CREATE TABLE #LoginConfig (
+									name char(10)
+								,	config_value char(25)
+							)
+
+	INSERT INTO #LoginConfig
+	EXEC master.sys.xp_loginconfig 'login mode'
+
+	--select * from #LoginConfig
+	INSERT INTO #AuditResults
+	SELECT		CAST(SERVERPROPERTY('machinename')as sysname) AS 'ServerName'
+			,	CAST(ISNULL(SERVERPROPERTY('instancename'), SERVERPROPERTY('machinename'))as sysname) AS 'InstanceName'
+			,	'' AS	LoginName 
+			,	config_value + ' Is in use.' + 
+						CASE WHEN config_value = 'Windows NT Authentication' 
+							THEN ' This is a best practice.'
+							ELSE ' This is not a best practice.'
+							END AS	Issue 
+			,	CASE WHEN config_value = 'Windows NT Authentication' THEN 10 ELSE 350 END AS Importance
+	FROM #LoginConfig
+
+
+/*
+	check config
+	https://docs.microsoft.com/en-us/sql/relational-databases/system-catalog-views/sys-configurations-transact-sql?view=sql-server-2017
+*/
+
+	IF OBJECT_ID('tempdb..#ConfigValues') IS NOT NULL
+	BEGIN
+		DROP TABLE #ConfigValues
+	END
+	IF OBJECT_ID('tempdb..#PreferedConfig') IS NOT NULL
+	BEGIN
+		DROP TABLE #PreferedConfig
+	END
+
+
+	Create TABLE #PreferedConfig (Name nvarchar(35),
+									Prefered bit,
+									Priority int
+								)
+	INSERT INTO #PreferedConfig
+	VALUES	(N'cross db ownership chaining', 0, 200)
+		,	(N'remote access', 0, 200)
+		,	(N'show advanced options', 0, 200)	
+		,	(N'remote proc trans', 0, 200)
+		,	(N'remote admin connections', 1, 200)	
+		,	(N'common criteria compliance enabled', 1, 200)	
+		,	(N'filestream access level', 0, 200)	
+		,	(N'Agent XPs', 0, 200)	
+		,	(N'Database Mail XPs', 0, 200)	
+		,	(N'SMO and DMO XPs', 0, 200)	
+		,	(N'xp_cmdshell', 0, 200)	
+		,	(N'default trace enabled', 1, 200)	
+		,	(N'contained database authentication', 1, 200)	
+
+
+	Create Table #ConfigValues (
+								name nvarchar(35), 
+								value_in_use sql_variant,
+								Prefered bit,
+								Priority int
+								)
+	
+	INSERT INTO #AuditResults
+	SELECT		CAST(SERVERPROPERTY('machinename')as sysname) AS 'ServerName'
+			,	CAST(ISNULL(SERVERPROPERTY('instancename'), SERVERPROPERTY('machinename'))as sysname) AS 'InstanceName'
+			,	'    -----    ' AS	LoginName 
+			,	'''' + sc.name + '''' + N' has a value of ' + cast(sc.value_in_use as nvarchar(30)) + N', the preference is ' + cast(pc.prefered as nchar(1)) + N'. This is informational only'
+			,	CASE WHEN sc.value_in_use = pc.prefered THEN pc.priority ELSE pc.priority + 50 END AS Importance
+	--SELECT sc.name, sc.value_in_use, pc.prefered, pc.priority
+	FROM [sys].configurations sc
+		INNER JOIN #PreferedConfig pc
+		ON sc.name = pc.name
+
+	--SELECT *
+	--FROM #ConfigValues
+
+	/*
+
+		Logging Level Auditing
+	*/
+
+	IF OBJECT_ID('tempdb..#LogingLevelAudit') IS NOT NULL
+	BEGIN
+		DROP TABLE #LogingLevelAudit
+	END
+
+	CREATE TABLE #LogingLevelAudit (
+									value char(10)
+								,	audit tinyint
+							)
+
+	INSERT INTO #LogingLevelAudit
+	EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'Software\Microsoft\MSSQLServer\MSSQLServer', N'AuditLevel'
+
+	--SELECT * FROM #LogingLevelAudit
+	INSERT INTO #AuditResults
+	SELECT		CAST(SERVERPROPERTY('machinename')as sysname) AS 'ServerName'
+			,	CAST(ISNULL(SERVERPROPERTY('instancename'), SERVERPROPERTY('machinename'))as sysname) AS 'InstanceName'
+			,	'' AS	LoginName 
+			,	'Login auditing is set to: ' + 
+						CASE WHEN audit in (1,3)
+							THEN 'None, this is not a best practice!'
+							WHEN audit = 2
+							THEN 'Failed logins only, this is the defult'
+							WHEN audit = 3
+							THEN 'Successful logins only'
+							WHEN audit = 4
+							THEN 'Both failed and successful logins'
+							END AS	Issue 
+			,	CASE WHEN audit in (1,3)
+							THEN 500
+							WHEN audit = 2
+							THEN 10
+							WHEN audit = 3
+							THEN 400
+							WHEN audit = 4
+							THEN 10
+							END AS Importance
+	FROM #LogingLevelAudit
+
+--Return the results
+
+	SELECT *
+	FROM #AuditResults
+	ORDER BY Importance DESC;
+"@
+
+#Write-Host "`nCRITICAL: SQL Server Database Security Auditing Report" -BackgroundColor Red -ForegroundColor White -NoNewline;
+
+    #If one exists, get Security Audit reports
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+Write-Host "`nCRITICAL: SQL Server Database Security Auditing Report" -BackgroundColor Red -ForegroundColor White -NoNewline;
+Write-Host ""
+    # Display the results to the console
+    $results.Tables[0] | Format-Table -AutoSize
+       
+###############################################################################################################################33
+    $cmd1 = @"
+/*
+Checks:
+-------
+1. SQL services account - All sql services must run under an AD account or Administrator account
+2. Default directories  - Data,Log and backup directories must not be in C:\ drive
+3. Startup Type         - SQL serices should be start automatically
+4. SA Account name      - Its a best practice to rename SA account 
+5. Disable SA account   - Create an alternate SQL user with SYSADMIN priileges and disable SA account
+6. Password Check       - Change SQL users password at every 3 months, 
+                          Don't make Username and password is same, 
+                          Don't user blank passwords
+7. SysAdmin User        - List of users who have sysadmin role.
+8. SQL Port Type        - SQL is using Static Port or Dynamic Port
+9. SQL Port             - Use any port other than 1433.
+10. Number of databases - Use 100 or < 100 databases for a server.
+11. Buildin Administrator - Disables Buildin\Administrator group from sql login. 
+12. Database level Access - Limit the db_owner users.                         
+*/
+
+
+IF OBJECT_ID('tempdb.dbo.#Result', 'U') IS NOT NULL
+  DROP TABLE #result
+
+CREATE TABLE #result (
+  CHECKS nvarchar(500),
+  RECOMMENTATION nvarchar(500)
+)
+
+IF OBJECT_ID('tempdb.dbo.#ServiceAccount', 'U') IS NOT NULL
+  DROP TABLE #serviceaccount
+
+CREATE TABLE #serviceaccount (
+  servicename varchar(100),
+  serviceaccount varchar(100)
+)
+
+INSERT INTO #serviceaccount
+  SELECT
+    servicename,
+    service_account
+  FROM sys.dm_server_services;
+
+--select * from #ServiceAccount 
+INSERT INTO #result
+  SELECT
+    Concat('Service Account - ', servicename),
+    CASE
+        WHEN serviceaccount like 'NT%' or serviceaccount like 'Local%' THEN 'Try to change an AD account or Administrator Account'
+      ELSE 'OK'
+    END AS Recommendation
+  FROM #serviceaccount
+
+IF OBJECT_ID('tempdb.dbo.#DataDirectory', 'U') IS NOT NULL
+  DROP TABLE #datadirectory
+
+CREATE TABLE #datadirectory (
+  directorytype varchar(500),
+  defaultdirectory nvarchar(500)
+)
+
+DECLARE @DefaultBackup nvarchar(512)
+
+EXEC master.dbo.Xp_instance_regread N'HKEY_LOCAL_MACHINE',
+                                    N'Software\Microsoft\MSSQLServer\MSSQLServer',
+                                    N'BackupDirectory',
+                                    @DefaultBackup OUTPUT
+
+INSERT INTO #datadirectory
+  SELECT
+    'Data',
+    CONVERT(nvarchar(500), SERVERPROPERTY('INSTANCEDEFAULTDATAPATH'))
+
+INSERT INTO #datadirectory
+  SELECT
+    'Log',
+    CONVERT(nvarchar(500), SERVERPROPERTY('INSTANCEDEFAULTLOGPATH'))
+
+INSERT INTO #datadirectory
+  SELECT
+    'Backup',
+    @DefaultBackup
+
+--select * from #DataDirectory 
+INSERT INTO #result
+  SELECT
+    Concat('Default Directory - ', directorytype),
+    CASE
+      WHEN defaultdirectory LIKE 'C:\%' THEN 'Please Avoid to keep Data files in C: drive'
+      ELSE 'OK'
+    END AS Recommendation
+  FROM #datadirectory
+
+IF OBJECT_ID('tempdb.dbo.#StartupType', 'U') IS NOT NULL
+   begin  DROP TABLE #startuptype end
+
+CREATE TABLE #startuptype (
+  sqlservice varchar(50),
+  startuptype nvarchar(50)
+)
+
+INSERT INTO #startuptype
+  SELECT
+    servicename,
+    startup_type_desc
+  FROM sys.dm_server_services;
+
+--select * from #StartupType 
+INSERT INTO #result
+  SELECT
+    Concat('Startup Type - ', sqlservice),
+    CASE
+      WHEN startuptype LIKE 'Manual' THEN 'Make this startup type as Automatic'
+      ELSE 'OK'
+    END AS Recommendation
+  FROM #startuptype
+
+IF OBJECT_ID('tempdb.dbo.#saname', 'U') IS NOT NULL
+  DROP TABLE #saname
+
+CREATE TABLE #saname (
+  NAME varchar(20)
+)
+
+INSERT INTO #saname
+  SELECT
+    NAME
+  FROM sys.sql_logins
+  WHERE sid = 0x01;
+
+INSERT INTO #result
+  SELECT
+    Concat('SA account name - ', NAME),
+    CASE
+      WHEN NAME = 'sa' THEN 'Rename SA account to someother name'
+      ELSE 'OK'
+    END AS Recomendation
+  FROM #saname
+
+IF OBJECT_ID('tempdb.dbo.#saaccountstatus', 'U') IS NOT NULL
+  DROP TABLE #saaccountstatus
+
+CREATE TABLE #saaccountstatus (
+  NAME varchar(10),
+  status int
+)
+
+INSERT INTO #saaccountstatus
+  SELECT
+    NAME,
+    is_disabled
+  FROM sys.server_principals
+  WHERE NAME = 'sa'
+
+INSERT INTO #result
+  SELECT
+    'SA Account Status',
+    CASE
+      WHEN status = 1 THEN 'OK'
+      ELSE 'Its a best practice to disable SA account or rename it'
+    END AS Recomendation
+  FROM #saaccountstatus
+
+IF OBJECT_ID('tempdb.dbo.#PasswordCheck', 'U') IS NOT NULL
+  DROP TABLE #passwordcheck
+
+CREATE TABLE #passwordcheck (
+  passwordtype varchar(20),
+  logins varchar(50)
+)
+
+INSERT INTO #passwordcheck
+  SELECT
+    'Name = Password',
+    NAME
+  FROM sys.sql_logins
+  WHERE Pwdcompare(NAME, password_hash) = 1;
+
+INSERT INTO #passwordcheck
+  SELECT
+    'Blank Password',
+    NAME
+  FROM sys.sql_logins
+  WHERE Pwdcompare('', password_hash) = 1;
+
+--select * from  #PasswordCheck 
+DECLARE @lastPassword TABLE (
+  date date,
+  logins varchar(100)
+)
+
+INSERT INTO @lastPassword
+  SELECT
+    CONVERT(date, LOGINPROPERTY([name], 'PasswordLastSetTime')) AS
+    'PasswordChanged',
+    NAME
+  FROM sys.sql_logins
+  WHERE NOT (LEFT([name], 2) = '##'
+  AND RIGHT([name], 2) = '##')
+  ORDER BY CONVERT(date, LOGINPROPERTY([name], 'PasswordLastSetTime'))
+
+INSERT INTO #passwordcheck
+  SELECT
+    Concat(DATEDIFF(DAY, date, (SELECT
+      CAST(GETDATE() AS date))
+    ), ' Days Ago'
+    ) AS
+    LastUpdated,
+    logins
+  FROM @lastPassword
+
+INSERT INTO #result
+  SELECT
+    Concat('Password Check - ', logins),
+    CASE
+      WHEN passwordtype = 'Name = Password' THEN 'User Name and password is same'
+      WHEN passwordtype = 'Blank Password' THEN 'Blank Password'
+      WHEN passwordtype LIKE '%Days Ago%' THEN 'Password updated before 90Days Ago'
+      ELSE 'OK'
+    END
+  FROM #passwordcheck
+
+IF OBJECT_ID('tempdb.dbo.#sysadminusers', 'U') IS NOT NULL
+  DROP TABLE #sysadminusers
+
+CREATE TABLE #sysadminusers (
+  logins varchar(50)
+)
+
+INSERT INTO #sysadminusers
+  SELECT
+    NAME
+  FROM master.sys.server_principals
+  WHERE IS_SRVROLEMEMBER('sysadmin', NAME) = 1
+  ORDER BY NAME
+
+INSERT INTO #result
+  SELECT
+    Concat('Admin User - ', logins),
+    'This user has SysAdmin role' AS Recomentation
+  FROM #sysadminusers
+
+IF OBJECT_ID('tempdb.dbo.#sqlport', 'U') IS NOT NULL
+  DROP TABLE #sqlport
+
+CREATE TABLE #sqlport (
+  porttype varchar(20),
+  portnumber int
+)
+
+DECLARE @kkportNo nvarchar(10)
+
+EXEC Xp_instance_regread @rootkey = 'HKEY_LOCAL_MACHINE',
+                         @key =
+                         'Software\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib\Tcp\IpAll',
+                         @value_name = 'TcpDynamicPorts',
+                         @value = @kkportNo OUTPUT
+
+INSERT INTO #sqlport
+  SELECT
+    'Dynamic Port',
+    @kkportNo
+
+GO
+
+DECLARE @kportNo nvarchar(10)
+
+EXEC Xp_instance_regread @rootkey = 'HKEY_LOCAL_MACHINE',
+                         @key =
+                         'Software\Microsoft\Microsoft SQL Server\MSSQLServer\SuperSocketNetLib\Tcp\IpAll',
+                         @value_name = 'TcpPort',
+                         @value = @kportNo OUTPUT
+
+INSERT INTO #sqlport
+  SELECT
+    'Static Port',
+    @kportNo
+
+--select * from #sqlport 
+INSERT INTO #result
+  SELECT
+    Concat('SQL Port - ', porttype),
+    portnumber
+  FROM #sqlport
+  WHERE portnumber IS NOT NULL
+
+INSERT INTO #result
+  SELECT
+    Concat('SQL Port Number ', portnumber),
+    CASE
+      WHEN portnumber = 1433 THEN 'Please change Default port Number for SQL Server'
+      WHEN portnumber != 1433 THEN 'OK'
+    END
+  FROM #sqlport
+  WHERE portnumber IS NOT NULL
+
+IF OBJECT_ID('tempdb.dbo.#numberofdb', 'U') IS NOT NULL
+  DROP TABLE #numberofdb
+
+CREATE TABLE #numberofdb (
+  count int
+)
+
+INSERT INTO #numberofdb
+  SELECT
+    COUNT(*)
+  FROM sys.databases
+
+INSERT INTO #result
+  SELECT
+    Concat('Number of DB - ', count),
+    CASE
+      WHEN count > 100 THEN 'Please remove unwanted Databases'
+      ELSE 'OK'
+    END
+  FROM #numberofdb
+
+IF OBJECT_ID('tempdb.dbo.#buildinadmin', 'U') IS NOT NULL
+  DROP TABLE #buildinadmin
+
+CREATE TABLE #buildinadmin (
+  login sysname,
+  status smallint
+)
+
+INSERT INTO #buildinadmin
+  SELECT
+    NAME,
+    status
+  FROM sys.syslogins
+  WHERE NAME = 'BUILTIN\Administrators'
+
+IF EXISTS (SELECT
+    *
+  FROM #buildinadmin
+  WHERE status = 9)
+  INSERT INTO #result
+    SELECT
+      'Is Buildin AdminGroup enabled',
+      CASE
+        WHEN status = '9' THEN 'Please remove BUILTIN\Administrators login'
+      END
+    FROM #buildinadmin
+ELSE
+  INSERT INTO #result
+    SELECT
+      'Is Buildin AdminGroup enabled',
+      'OK'
+ Insert into #result 
+ values 
+ ('For More Updates','Talk to DB Expert - Ketan Chawda')
+SELECT
+  *
+FROM #result
+
+-------------------------------
+-- Database Level Privileges --
+-------------------------------
+DECLARE @DB_USers TABLE (
+  DBName sysname,
+  UserName sysname,
+  LoginType sysname,
+  AssociatedRole varchar(max),
+  create_date datetime,
+  modify_date datetime
+)
+
+INSERT @DB_USers
+EXEC sp_MSforeachdb '
+use [?]
+SELECT ''?'' AS DB_Name,
+case prin.name when ''dbo'' then prin.name + '' (''+ (select SUSER_SNAME(owner_sid) from master.sys.databases where name =''?'') + '')'' else prin.name end AS UserName,
+prin.type_desc AS LoginType,
+isnull(USER_NAME(mem.role_principal_id),'''') AS AssociatedRole ,create_date,modify_date
+FROM sys.database_principals prin
+LEFT OUTER JOIN sys.database_role_members mem ON prin.principal_id=mem.member_principal_id
+WHERE prin.sid IS NOT NULL and prin.sid NOT IN (0x00) and
+prin.is_fixed_role <> 1 AND prin.name NOT LIKE ''##%'''
+
+SELECT
+  DBname,
+  UserName,
+  LoginType,
+  create_date as CreateDate,
+  modify_date as ModifiedDate,
+  STUFF((SELECT
+    ',' + CONVERT(varchar(500), associatedrole)
+  FROM @DB_USers user2
+  WHERE user1.DBName = user2.DBName
+  AND user1.UserName = user2.UserName
+  FOR xml PATH ('')), 1, 1, '') AS PermissionUser
+FROM @DB_USers user1
+GROUP BY dbname,
+         username,
+         logintype,
+         create_date,
+         modify_date
+ORDER BY DBName, username
+"@
+  
+    #If one exists, get Security Audit reports
+    try {
+        $results = $server.ExecuteWithResults($cmd1)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+Write-Host "`nCRITICAL: SQL Server Auditing SYSADMIN / DB-OWNER Database User Report" -BackgroundColor Red -ForegroundColor White -NoNewline;
+Write-Host ""
+#Write-Host "`nCRITICAL: SQL Server Auditing DB-OWNER Database User Report" -BackgroundColor Red -ForegroundColor White -NoNewline;
+
+#Write-Host "`nSQL Server Database Security Auditing Report" -BackgroundColor Red -ForegroundColor White -NoNewline;
+    # Display the results to the console
+    $results.Tables[0] | Format-Table -AutoSize
+      
+#Write-Host "`nWARNING:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+
+###---ServerName	InstanceName	LoginName	Issue	Importance
+
+    
+###---$results.Tables[0] | Select-Object ServerName, InstanceName, LoginName, Issue, Importance | Format-Table -AutoSize
+
+} #Get-SqlAudit
+
+### #### ####
+
+function Get-SqlChkMelt {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $server = Get-SqlConnection $targetServer
+
+    #Get-SqlChkMelt
+
+$cmdchk = "
+SET NOCOUNT ON;
+
+-- Declare variables
+DECLARE @MachineIdentification varchar(128) = '';
+DECLARE @ProductVersion varchar(20) = '';
+DECLARE @ProductBuild int = 0;
+DECLARE @PatchStatus varchar(15) = 'not patched';
+DECLARE @FinalPatchMessage varchar(256) = '';
+
+SET @MachineIdentification = 'Server Name = ' + CONVERT(varchar(50), SERVERPROPERTY ('MachineName')) + ', Instance Name = ' + ISNULL(CONVERT(varchar(50), SERVERPROPERTY('InstanceName')), 'None') + ': ';
+
+-- Figure out major version number and then get the build number
+SET @ProductVersion = CONVERT(varchar(20), SERVERPROPERTY('ProductVersion'));
+SET @ProductBuild = CONVERT(int, SERVERPROPERTY('ProductBuild'));
+
+-- SQL Server 2008
+ IF @ProductVersion LIKE '10.0%'
+	BEGIN
+		IF @ProductVersion = '10.0.6556.0'
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage = 'SQL Server 2008 '  + '. This SQL Server instance is ' + @PatchStatus + ' against <  << <<< Spectre/Meltdown >>> >>  >';	
+	END
+
+-- Description of the security update for SQL Server 2008 SP4 GDR: January 6, 2018
+-- https://support.microsoft.com/en-us/help/4057114
+-- Build 10.0.6556.0
+
+-- SQL Server 2008 R2
+IF @ProductVersion LIKE '10.5%'
+	BEGIN
+		IF @ProductVersion = '10.50.6560.0'
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage =  'SQL Server 2008 R2 '  + '. This SQL Server instance is ' + @PatchStatus + ' against <  << <<< Spectre/Meltdown >>> >>  >';
+	END
+
+-- Description of the security update for SQL Server 2008 R2 SP3 GDR: January 6, 2018
+-- https://support.microsoft.com/en-us/help/4057113
+-- 10.50.6560.0 
+
+-- SQL Server 2012 
+-- We have ProductBuild in SQL Server 2012 and newer
+IF @ProductVersion LIKE '11%'
+	BEGIN
+		IF @ProductBuild >= 7462
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage =  'SQL Server 2012 '  + '. This SQL Server instance is ' + @PatchStatus + + ' against <  << <<< Spectre/Meltdown >>> >>  >';
+	END
+
+-- Description of the security update for SQL Server 2012 SP4 GDR: January 12, 2018
+-- https://support.microsoft.com/en-us/help/4057116
+-- Build 11.0.7462.6
+
+-- SQL Server 2014
+IF @ProductVersion LIKE '12%'
+	BEGIN
+		IF @ProductBuild >= 5571 -- SP2 CU10
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 5214 -- SP2 GDR
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage = 'SQL Server 2014 '  + '. This SQL Server instance is ' + @PatchStatus + + ' against <  << <<< Spectre/Meltdown >>> >>  >';
+	END
+
+-- Description of the security update for SQL Server 2014 SP2 CU10: January 16, 2018
+-- https://support.microsoft.com/en-us/help/4057117
+-- Build 12.0.5571.0
+
+-- Description of the security update for SQL Server 2014 SP2 GDR: January 16, 2018
+-- https://support.microsoft.com/en-us/help/4057120
+-- Build 12.0.5214.6
+
+-- SQL Server 2016
+IF @ProductVersion LIKE '13%'
+	BEGIN
+		IF @ProductBuild >= 4466 -- SP1 CU7
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 4210  -- SP1 GDR
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 2218  -- RTM CU
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 1745  -- RTM GDR
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage = 'SQL Server 2016 '  + '. This SQL Server instance is ' + @PatchStatus + + ' against <  << <<< Spectre/Meltdown >>> >>  >';
+	END
+
+-- Description of the security update for SQL Server 2016 CU7 SP1: January 3, 2018
+-- https://support.microsoft.com/en-us/help/4058561
+-- Build 13.0.4466.4
+ 
+-- Description of the security update for SQL Server 2016 GDR SP1: January 3, 2018 
+-- https://support.microsoft.com/en-us/help/4057118
+-- Build 13.0.4210.6
+
+-- Description of the security update for SQL Server 2016 CU: January 6, 2018
+-- https://support.microsoft.com/en-us/help/4058559
+-- Build 13.0.2218.0 
+
+-- Description of the security update for SQL Server 2016 GDR: January 6, 2018
+-- https://support.microsoft.com/en-us/help/4058560
+-- Build 13.0.1745.2 
+
+
+-- SQL Server 2017
+IF @ProductVersion LIKE '14%'
+	BEGIN
+		IF @ProductBuild >= 3015 -- 2017 CU3
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		IF @ProductBuild = 2000  -- 2017 GDR
+			BEGIN
+				SET @PatchStatus = 'patched';
+			END
+		SET @FinalPatchMessage =  'SQL Server 2017 '  + '. This SQL Server instance is ' + @PatchStatus + + ' against <  << <<< Spectre/Meltdown >>> >>  >';
+	END
+
+-- Description of the security update for SQL Server 2017 GDR: January 3, 2018
+-- https://support.microsoft.com/en-us/help/4057122
+-- Build 14.0.2000.63
+ 
+-- Description of the security update for SQL Server 2017 CU3 RTM: January 3, 2018
+-- https://support.microsoft.com/en-us/help/4058562
+-- Build 14.0.3015.40 
+
+-- SQL Server 2019
+IF @ProductVersion LIKE '15%'
+	BEGIN	
+		SET @PatchStatus = 'patched';	
+		SET @FinalPatchMessage =  'SQL Server 2019 '  + '. This SQL Server instance is ' + @PatchStatus + + ' against <  << <<< Spectre/Meltdown >>> >>  >';
+	END
+
+PRINT @FinalPatchMessage;
+SELECT @FinalPatchMessage AS [SQL Server Patch Status];
+"
+
+    try {
+$sqlchk = $server.ExecuteScalar($cmdchk)
+
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+
+    #Display the results to the console
+    
+        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName) - Spectre/Meltdown Check"
+Write-Host " "
+Write-Host " "
+Write-Host "# Spectre/Meltdown Check :: "  $($server.TrueName) " :: $($sqlchk) " 
+#Write-Host "# Spectre/Meltdown Check :: " -BackgroundColor Red -ForegroundColor Yellow -NoNewline;  Write-Host " $($sqlchk) " -BackgroundColor Red -ForegroundColor White -NoNewline;
+Write-Host " "
+
+} #Get-SqlChkMelt
+
+#### #### #####
+
+### #### ####
+
+function Get-SqlChkEof {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $server = Get-SqlConnection $targetServer
+
+    #Get-SqlChkMelt
+
+$cmdchkk = "
+SELECT
+N'SQL Server version ' + v.SQLVersion + N' mainstream support ends on '
++ v.EoMainstream + N', and extended support ends on ' + v.EoExtended
++ N'. 
+
+Please consider upgrading to the latest SQL version to enjoy bug fixes !!!,
+
+Database performance improvements, and security updates for as long as possible. !!!'
+, v.EoMainstream
+FROM (VALUES
+ ('2000',  8, '4/8/2008'	, '4/9/2013')
+,('2005',  9, '4/12/2011'	, '4/12/2016')
+,('2008', 10, '7/8/2014'	, '7/9/2019')
+,('2012', 11, '7/11/2017'	, '7/12/2022')
+,('2014', 12, '7/9/2019'	, '7/9/2024')
+,('2016', 13, '7/13/2021'	, '7/14/2026')
+,('2017', 14, '10/11/2022'	, '10/12/2027')
+,('2019', 15, '1/7/2025'	, '1/8/2030')
+,('2022', 16, '1/11/2028'	, '1/11/2033')
+) AS v(SQLVersion, MajorVersion, EoMainstream, EoExtended)
+WHERE 1=1
+AND CONVERT(DATETIME, v.EoMainstream, 101) < GETDATE()
+AND v.MajorVersion = CAST(SERVERPROPERTY('ProductMajorVersion') AS INT)
+AND CAST(SERVERPROPERTY('Edition') AS varchar(100)) <> 'SQL Azure'
+OPTION(RECOMPILE);
+"
+
+    try {
+$sqlchkk = $server.ExecuteScalar($cmdchkk)
+
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+
+    #Display the results to the console
+    
+        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName) - Database EOL Check"
+Write-Host " "
+Write-Host "# SQL Server Database EOL Check # " " !!! $($sqlchkk) !!! " 
+#Write-Host "# SQL Server Database EOL Check  :: " -BackgroundColor Red -ForegroundColor Yellow -NoNewline;  Write-Host " $($sqlchkk) " -BackgroundColor Red -ForegroundColor White -NoNewline;
+Write-Host " "
+
+} #Get-SqlChkEof
+
+#########################################
+
+function Get-LoginChk {
+    Param (
+        [CmdletBinding()]
+        [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    # Get status of each database
+    $server = Get-SqlConnection $targetServer
+
+    $LoginSACmd = @"
+SELECT name, principal_id, type_desc, is_disabled, is_fixed_role, create_date from sys.server_principals where name='sa';
+SELECT
+CASE
+WHEN ses.session_id= @@SPID THEN 'It''s me !!! '
+ELSE '' END 
++ coalesce(ses.login_name,'???') as WhosGotTheDAC,
+ses.session_id,
+ses.login_time,
+ses.status,
+ses.original_login_name
+from sys.endpoints as en
+join sys.dm_exec_sessions ses on
+en.endpoint_id=ses.endpoint_id
+where en.name='Dedicated Admin Connection';
+"@
+
+    $LogindacCmd = @"
+SELECT
+CASE
+WHEN ses.session_id= @@SPID THEN 'It''s me !!! '
+ELSE '' END 
++ coalesce(ses.login_name,'???') as WhosGotTheDAC,
+ses.session_id,
+ses.login_time,
+ses.status,
+ses.original_login_name
+from sys.endpoints as en
+join sys.dm_exec_sessions ses on
+en.endpoint_id=ses.endpoint_id
+where en.name='Dedicated Admin Connection';
+"@
+
+    $LoginAdminCmd = @"
+SELECT p.name AS [loginname],
+s.sysadmin as is_sysadmin,
+    p.type,
+    p.type_desc,
+    CONVERT(VARCHAR(10), p.create_date, 101) AS [created],
+    CONVERT(VARCHAR(10), p.modify_date, 101) AS [updated],
+    p.is_disabled,
+    CASE COALESCE(sl.is_expiration_checked, -1)
+        WHEN 0 THEN 'No'
+        WHEN 1 THEN 'Yes'
+        ELSE '--'
+        END AS [is_expiration_checked],
+    CASE COALESCE(sl.is_policy_checked, -1)
+        WHEN 0 THEN 'No'
+        WHEN 1 THEN 'Yes'
+        ELSE '--'
+        END  AS [is_policy_checked],
+    LOGINPROPERTY(sl.name, 'PasswordLastSetTime') AS PasswordLastSetTime
+FROM sys.server_principals AS p
+    JOIN sys.syslogins AS s ON p.sid = s.sid
+    LEFT JOIN sys.sql_logins AS sl ON sl.sid = p.sid
+WHERE p.type_desc IN('SQL_LOGIN', 'WINDOWS_LOGIN', 'WINDOWS_GROUP')
+    -- Logins that are not process logins
+    AND p.name NOT LIKE '##%'
+    AND p.name NOT LIKE 'NT SERVICE%'
+    -- Logins that are sysadmins
+    AND s.sysadmin = 1 ;
+"@
+
+$LoginOwnerCmd = @"
+
+IF OBJECT_ID('tempdb..#dbOwners') IS NOT NULL
+    DROP TABLE #dbOwners
+
+CREATE TABLE #dbOwners (
+    Database_Name NVARCHAR(2560)
+    , database_role_name NVARCHAR(100)
+    , server_user_name  NVARCHAR(256)
+    , [Role Removal Script - Be EXTREMELY careful] NVARCHAR(1000)
+    )
+
+INSERT #dbOwners
+EXEC sp_MSforeachdb 'USE ? 
+SELECT ''?'' AS [Database name]
+,    DP1.name AS database_role_name
+,    isnull(DP2.name, ''No members'') AS server_user_name  
+, ''USE ''+ ''?'' + ''; EXEC sp_droprolemember [''+DP1.name+''], [''+DP2.name+''];  '' AS [Role Removal Script - Be EXTREMELY careful]
+FROM sys.database_role_members AS DRM  
+RIGHT OUTER JOIN sys.database_principals DP1  
+    ON DRM.role_principal_id = DP1.principal_id  
+LEFT OUTER JOIN sys.database_principals DP2  
+    ON DRM.member_principal_id = DP2.principal_id  
+WHERE DP1.name LIKE ''%db_owner%'' 
+AND DP2.name NOT LIKE ''%dbo%''
+ORDER BY DP1.name; '
+
+SELECT * FROM #dbOwners;
+"@
+
+$LoginFailedCmd = @"
+
+DECLARE @TSQL  NVARCHAR(1000)
+DECLARE @lC    INT
+
+CREATE TABLE #TempLog (
+      LogDate     DATETIME,
+      ProcessInfo NVARCHAR(40),
+      [Text] NVARCHAR(MAX))
+
+CREATE TABLE #logF (
+      ArchiveNumber     INT,
+      LogDate           DATETIME,
+      LogSize           INT
+)
+
+INSERT INTO #logF   
+EXEC sp_enumerrorlogs
+SELECT @lC = MIN(ArchiveNumber) FROM #logF
+
+WHILE @lC IS NOT NULL
+
+BEGIN
+      INSERT INTO #TempLog
+      EXEC sp_readerrorlog @lC
+      SELECT @lC = MIN(ArchiveNumber) FROM #logF 
+      WHERE ArchiveNumber > @lC
+END
+
+--Failed login counts. Useful for security audits.
+
+SELECT Text,COUNT(Text) Number_Of_Attempts
+FROM #TempLog where 
+Text like '%failed%' and ProcessInfo = 'LOGON'
+Group by Text
+
+--Find Last Successful login. Useful to know before deleting "obsolete" accounts.
+
+SELECT Distinct MAX(logdate) last_login,Text 
+FROM #TempLog 
+where ProcessInfo = 'LOGON'and Text like '%SUCCEEDED%' 
+and Text not like '%NT AUTHORITY%'
+Group by Text;
+
+DROP TABLE #TempLog
+DROP TABLE #logF
+"@
+
+    try {
+        $lsaQueries = $server.ExecuteWithResults($LoginSACmd)
+        $ladmQueries = $server.ExecuteWithResults($LoginAdminCmd)
+        $lownQueries = $server.ExecuteWithResults($LoginOwnerCmd)
+        $lfalQueries = $server.ExecuteWithResults($LoginFailedCmd)
+    }
+    catch {
+        Write-Error "Error executing SQL query: $_"
+        return
+    }
+
+    # Display the results to the console
+
+#####################
+
+if ($lsaQueries.Tables[0].Rows.Count -gt 0) {
+        Write-Host "`nSA Admin Login Check !!!  [ 1 = disabled and 0 = enabled] ($($lsaQueries.Tables[0].Rows.Count)):" -BackgroundColor Red -ForegroundColor Yellow
+        
+$lsaQueries.Tables[0] | Format-Table -AutoSize -Property name, principal_id, type_desc, is_disabled, is_fixed_role, create_date
+
+Write-Host "`nDedicated Admin Connection << < D A C > >> Login Check !!!  ($($lsaQueries.Tables[0].Rows.Count)):" -BackgroundColor Red -ForegroundColor Yellow
+
+$lsaQueries.Tables[0] | Format-Table -AutoSize -Property WhosGotTheDAC, session_id, login_time, ses.status, original_login_name
+
+    }
+
+####################
+
+    if ($ladmQueries.Tables[0].Rows.Count -gt 0) {
+        Write-Host "`nLogin with ADMIN Grants ($($ladmQueries.Tables[0].Rows.Count)):" -BackgroundColor Red -ForegroundColor Yellow
+        $ladmQueries.Tables[0] | Format-Table -AutoSize -Property loginname, is_sysadmin, type, type_desc, created, updated, is_disabled, is_expiration_checked, is_policy_checked, PasswordLastSetTime
+    }
+    else {
+        Write-Host "`nNo Login with Admin Grants Found." -ForegroundColor Green
+    }
+
+    if ($lownQueries.Tables[0].Rows.Count -gt 0) {
+        Write-Host "`nLogin with DB-OWNER Grants" -BackgroundColor Red -ForegroundColor Yellow
+        $lownQueries.Tables[0] | Format-Table -AutoSize -Property Database_Name, Database_role_name, Server_user_name, 'Role Removal Script - Be EXTREMELY careful'
+Write-Host " "
+        Write-Host "`nFailed Login Session to FIX " -BackgroundColor Red -ForegroundColor Yellow
+        $lfalQueries.Tables[0] | Format-Table -AutoSize -Property Text, Number_Of_Attempts
+    
+    }
+    else {
+        Write-Host "`nNo Logins found." -ForegroundColor Green
+    }
+}
+
+# Example usage:
+# Get-LoginChk -targetServer "YourServerName"
+
+#########################################
+function Get-Smtpk {
+    Param (
+        [CmdletBinding()]
+        [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    # Get status of each database
+    $server = Get-SqlConnection $targetServer
+
+    $MailCmd = @"
+/* 
+   Confirm the Database Mail account and profile is configured correctly 
+*/ 
+
+DECLARE @DatabaseMail VARCHAR(255);  
+
+SELECT   
+    ProfileName = smp.name  
+    ,AccountName = sma.name  
+    ,AccountFromAddress = sma.email_address  
+    ,AccountReplyTo = sma.replyto_address  
+    ,SMTPServer = sms.servername  
+    ,SMTPPort = sms.port  
+FROM msdb.dbo.sysmail_account sma  
+    INNER JOIN msdb.dbo.sysmail_profileaccount smpa ON sma.account_id = smpa.account_id  
+    INNER JOIN msdb.dbo.sysmail_profile smp ON smpa.profile_id = smp.profile_id  
+    INNER JOIN msdb.dbo.sysmail_server sms ON sma.account_id = sms.account_id;
+
+/*  
+    Confirm SQL Server Agent is configured to use Database Mail correctly  
+*/  
+DECLARE @res TABLE  
+(  
+    Value VARCHAR(255)  
+    , Data VARCHAR(255)  
+);  
+INSERT INTO @res  
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', N'UseDatabaseMail';  
+INSERT INTO @res  
+EXEC master.dbo.xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\Microsoft\MSSQLServer\SQLServerAgent', N'DatabaseMailProfile';  
+IF (  
+        SELECT COUNT(*)  
+        FROM @res r  
+        WHERE r.Value = 'UseDatabaseMail' AND r.Data = 1  
+    ) = 1 AND   
+    (  
+        SELECT COUNT(*)  
+        FROM @res r  
+        WHERE r.Value = 'DatabaseMailProfile' AND r.Data IS NOT NULL  
+    ) = 1  
+SET @DatabaseMail = 'SMTP Configured - OK'  
+ELSE  
+SET @DatabaseMail = 'SMTP Not Configured';  
+
+select @DatabaseMail
+"@
+
+    try {
+        $Mailk = $server.ExecuteWithResults($MailCmd)
+        
+    }
+    catch {
+        Write-Error "Error executing SQL query: $_"
+        return
+    }
+
+    # Display the results to the console
+    if ($Mailk.Tables[0].Rows.Count -gt 0) {
+        Write-Host "`nDatabase Mail Config Details ($($Mailk.Tables[0].Rows.Count)):" -BackgroundColor Red -ForegroundColor White
+        $Mailk.Tables[0] | Format-Table -AutoSize -Property ProfileName, AccountName, AccountFromAddress, SMTPServer, SMTPPort
+    }
+
+}
+
+# Example usage:
+# Get-Smtpk
+#########################################
+
+function K-EBSVolumes {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    $server = Get-SqlConnection $targetServer
+
+$mountPoints = @("E:\", "F:\", "H:\")
+
+# Initialize an empty array to store results
+$outputResults = @()
+
+foreach ($mountPoint in $mountPoints) {
+    $partitions = Get-Partition | Where-Object { $_.AccessPaths -like "$mountPoint*" }
+
+    foreach ($partition in $partitions) {
+        $volume = Get-Volume -Partition $partition
+
+        # Create an object with the relevant information
+        $result = [PSCustomObject]@{
+            MountPoint      = $partition.AccessPaths
+            FileSystemLabel = $volume.FileSystemLabel
+            HealthStatus    = if ($volume.FileSystemLabel -and $volume.HealthStatus -eq "Healthy") { "Healthy" } else { "Unhealthy" }
+        }
+
+        # Add the result object to the array
+        $outputResults += $result
+    }
+}
+
+# Display the results from the variable
+$outputResults | Format-Table -AutoSize
+
+
+$results.Tables[0] = $outputResults 
+}
+####################   MAIN   ########################
+Clear-Host
+
+$startTime = Get-Date
+
+[string[]]$targetServerList = $null
+
+#Get the server list from the CMS group, only if one was specified
+if($cmsServer) {
+    $targetServerList = Get-CmsServer -cmsServer $cmsServer -cmsGroup $cmsGroup -recurse
+}
+else {
+    $targetServerList = $serverList
+}
+
+#Check SQL Server
+Write-Host " "
+Write-Host "                 < < < < < < <  <  <  < # >  >  >  > > > > > >                " -BackgroundColor Black -ForegroundColor Red
+#Write-Host "###  Ketan's Daily Check - SQL Server Report (DD.HH:MM:SS):  ###" -BackgroundColor Red -ForegroundColor Yellow
+Write-Host "# > >  Ketan's Daily Check - SQL Server Report ($((Get-Date).ToString('dd-MMM-yyyy')) - $((Get-Date).ToString('HH:mm:ss')))  < < #" -BackgroundColor Red -ForegroundColor Yellow
+Write-Host "                 < < < < < < <  <  <  < # >  >  >  > > > > > >                " -BackgroundColor Black -ForegroundColor Green
+
+Write-Host " "
+Write-Host " G O O D  M.O.R.N.I.N.G .. .. . Ketan Chawda !!!"
+Write-Host " "
+Write-Host " "
+#Check uptime of each SQL Server
+Write-Host "##########  SQL Server Uptime Report ($((Get-Date).ToString('dd-MMM-yyyy'))):  ###########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-SqlUptime -targetServer $targetServer}
+Write-Host " "
+Write-Host "##########  Server Hardware Informations Report ($((Get-Date).ToString('dd-MMM-yyyy'))):  ###########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-SqlUptime2 -targetServer $targetServer}
+Write-Host " "
+Write-Host "##########  SQL Server Memory Recommendations Report ($((Get-Date).ToString('dd-MMM-yyyy'))):  ###########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-SqlUptime3 -targetServer $targetServer}
+#Get the status of each SQL service
+Write-Host "`n##########  SQL Server Service(s) Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-ServiceStatus -targetServer $targetServer }
+
+Start-Sleep -s 10
+
+#Get the state of each Windows cluster node
+Write-Host "`n##########  Windows Cluster Node Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-ClusterStatus -targetServer $targetServer }
+
+#Get status of each Availability Group for each server
+Write-Host "`n##########  Availability Groups Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-AGStatus -targetServer $targetServer}
+
+#Get status of each database for each server
+Write-Host "`n##########  Database Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-DatabaseStatus -targetServer $targetServer}
+Write-Host " "
+
+Start-Sleep -s 10
+
+#Get the most recent backup of each database
+Write-Host "`n##########  Database Backup Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-DatabaseBackupStatus -targetServer $targetServer}
+
+Start-Sleep -s 10
+
+#Get the disk space info for each server
+Write-Host "`n##########  Disk Space Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-DiskSpace -targetServer $targetServer}
+
+#Get the failed jobs for each server
+Write-Host "`n##########  Failed Jobs Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-FailedJobs -targetServer $targetServer}
+
+##KC
+
+#Get the failed jobs for each server
+Write-Host "`n##########  Long Running SQL Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-LongRunSQL -targetServer $targetServer}
+
+Start-Sleep -s 10
+
+#Get the failed jobs for each server
+Write-Host "`n##########  SQL Server Error Log Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-Errorlog -targetServer $targetServer}
+
+Start-Sleep -s 10
+
+#Check the Application event log for SQL errors
+#Write-Host "`n##########  Application Event Log Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+#ForEach ($targetServer in $targetServerList) { Get-AppLogEvents -targetServer $targetServer}
+
+#Get the failed jobs for each server
+#Write-Host "`n##########  SQL Server Error Log Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+#ForEach ($targetServer in $targetServerList) { Get-SqlErrorLogMessages -targetServer $targetServer}
+
+#Get the EBS Volume health for each server
+#Write-Host "`n##########  EBS Volume Health Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+#ForEach ($targetServer in $targetServerList) { Get-EBSVolumes -targetServer $targetServer}
+
+###Get-SqlChkMelt
+Write-Host "`n##########  SQL Server Spectre / Meltdown Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-SqlChkMelt -targetServer $targetServer}
+Write-Host " "
+
+###Get-Smtpk
+Write-Host "`n##########  SQL Server SMTP  Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-Smtpk -targetServer $targetServer}
+Write-Host " "
+
+###Get-SqlChkEof
+Write-Host "`n##########  SQL Server Database EOL Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-SqlChkEof -targetServer $targetServer}
+Write-Host " "
+
+###Get-Smtpk
+
+Write-Host " "
+Write-Host "# >> >  Ketan's Daily Check - SQL Server Report completed.... ($((Get-Date).ToString('dd-MMM-yyyy')) - $((Get-Date).ToString('HH:mm:ss')))  < << #" -BackgroundColor Red -ForegroundColor Yellow
+#Write-Host ""
+Write-Host "`nElapsed Time: $(New-TimeSpan -Start $startTime -End (Get-Date))"
+Start-Sleep -s 10
+
+###Get-LoginChk
+Write-Host ""
+Write-Host " " -ForegroundColor Yellow
+Write-Host " Review SQL Server ## LOGINS ## Security Auditing Report Y/N !!! " -ForegroundColor Yellow
+Write-Host " " -ForegroundColor Yellow
+Start-Sleep -s 20
+
+###Get-LoginChk
+Write-Host " "
+Write-Host "`n##########  SQL Server Database Logins Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-LoginChk -targetServer $targetServer}
+Write-Host " "
+
+
+#---AUDIT TO START
+#Write-Host ""
+#Write-Host "`n##########  Review SQL Server Database Security Audit Report Y/N !!!  ##########" -BackgroundColor Black -ForegroundColor Green
+#Write-Host " Review SQL Server Database Security Audit Report Y/N !!! "
+#Write-Host ""
+#Start-Sleep -s 10
+#Write-Host ""
+#Get the failed jobs for each server
+#Write-Host "`n##########  SQL Server Security Audit Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+#ForEach ($targetServer in $targetServerList) { Get-SqlAudit -targetServer $targetServer}
+
+#Write-Host "`nElapsed Time: $(New-TimeSpan -Start $startTime -End (Get-Date))"
+
+
+##============================================================================================================================
+# Check SQL Server Error Log Messages
+
+
+#Write-Host "`n##########  SQL Server Error Log Messages:  ##########" -BackgroundColor Black -ForegroundColor Green
+
+Write-Host "`n##########  EBS Volume Health Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+$mountPoints = @("E:\", "F:\", "H:\")
+
+# Initialize an empty array to store results
+$outputResults = @()
+
+foreach ($mountPoint in $mountPoints) {
+    $partitions = Get-Partition | Where-Object { $_.AccessPaths -like "$mountPoint*" }
+
+    foreach ($partition in $partitions) {
+        $volume = Get-Volume -Partition $partition
+
+        # Create an object with the relevant information
+        $result = [PSCustomObject]@{
+            MountPoint      = $partition.AccessPaths
+            FileSystemLabel = $volume.FileSystemLabel
+            HealthStatus    = if ($volume.FileSystemLabel -and $volume.HealthStatus -eq "Healthy") { "Healthy" } else { "Unhealthy" }
+        }
+
+        # Add the result object to the array
+        $outputResults += $result
+    }
+}
+
+# Display the results from the variable
+$outputResults | Format-Table -AutoSize
+
+
+# List the Windows disks
+
+# Create a hash table that maps each device to a SCSI target
+$Map = @{"0" = '/dev/sda1'} 
+for($x = 1; $x -le 26; $x++) {$Map.add($x.ToString(), [String]::Format("xvd{0}",[char](97 + $x)))}
+for($x = 78; $x -le 102; $x++) {$Map.add($x.ToString(), [String]::Format("xvdc{0}",[char](19 + $x)))}
+
+Try {
+    # Use the metadata service to discover which instance the script is running on
+    $InstanceId = (Invoke-WebRequest '169.254.169.254/latest/meta-data/instance-id').Content
+    $AZ = (Invoke-WebRequest '169.254.169.254/latest/meta-data/placement/availability-zone').Content
+    $Region = $AZ.Substring(0, $AZ.Length -1)
+
+    #Get the volumes attached to this instance
+    $BlockDeviceMappings = (Get-EC2Instance -Region $Region -Instance $InstanceId).Instances.BlockDeviceMappings
+}
+Catch
+{
+    Write-Host "Could not access the AWS API, therefore, VolumeId is not available. 
+Verify that you provided your access keys."  -ForegroundColor Yellow
+}
+
+Get-WmiObject -Class Win32_DiskDrive | % {
+    $Drive = $_
+    # Find the partitions for this drive
+    Get-WmiObject -Class Win32_DiskDriveToDiskPartition |  Where-Object {$_.Antecedent -eq $Drive.Path.Path} | %{
+        $D2P = $_
+        # Get details about each partition
+        $Partition = Get-WmiObject -Class Win32_DiskPartition |  Where-Object {$_.Path.Path -eq $D2P.Dependent}
+        # Find the drive that this partition is linked to
+        $Disk = Get-WmiObject -Class Win32_LogicalDiskToPartition | Where-Object {$_.Antecedent -in $D2P.Dependent} | %{ 
+            $L2P = $_
+            #Get the drive letter for this partition, if there is one
+            Get-WmiObject -Class Win32_LogicalDisk | Where-Object {$_.Path.Path -in $L2P.Dependent}
+        }
+        $BlockDeviceMapping = $BlockDeviceMappings | Where-Object {$_.DeviceName -eq $Map[$Drive.SCSITargetId.ToString()]}
+           
+        # Display the information in a table
+        New-Object PSObject -Property @{
+            Device = $Map[$Drive.SCSITargetId.ToString()];
+            Disk = [Int]::Parse($Partition.Name.Split(",")[0].Replace("Disk #",""));
+            Boot = $Partition.BootPartition;
+            Partition = [Int]::Parse($Partition.Name.Split(",")[1].Replace(" Partition #",""));
+            SCSITarget = $Drive.SCSITargetId;
+            DriveLetter = If($Disk -eq $NULL) {"NA"} else {$Disk.DeviceID};
+            VolumeName = If($Disk -eq $NULL) {"NA"} else {$Disk.VolumeName};
+            VolumeId = If($BlockDeviceMapping -eq $NULL) {"NA"} else {$BlockDeviceMapping.Ebs.VolumeId}
+        }
+    }
+} | Sort-Object Disk, Partition | Format-Table -AutoSize -Property Disk, Partition, SCSITarget, DriveLetter, Boot, 
+VolumeId, Device, VolumeName
+# -----------------------------------------------------------------------------
+# Author:      Ketan Chawda (Modified)
