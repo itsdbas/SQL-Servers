@@ -1,0 +1,240 @@
+--- 2K
+
+$SQLServer = "DESKTOP-ODRPFI6"  # Change this to your SQL Server instance
+$Instance = "MSSQLSERVER" # Change for named instances
+
+# Function to execute SQL Query
+Function Invoke-SqlQuery {
+    param (
+        [string]$Query
+    )
+    Invoke-Sqlcmd -ServerInstance DESKTOP-ODRPFI6 -Query $Query
+}
+
+# Check SQL Services
+Get-Service | Where-Object { $_.Name -like "MSSQL*" -or $_.Name -like "SQLAgent*" }
+
+# Check max degree of parallelism (MAXDOP)
+Invoke-SqlQuery "SELECT name, value_in_use FROM sys.configurations WHERE name = 'max degree of parallelism'"
+
+# Check Cost Threshold for Parallelism
+Invoke-SqlQuery "SELECT name, value_in_use FROM sys.configurations WHERE name = 'cost threshold for parallelism'"
+
+# Check Optimize for Ad-hoc Workloads
+Invoke-SqlQuery "SELECT name, value_in_use FROM sys.configurations WHERE name = 'optimize for ad hoc workloads'"
+
+# Check Network Packet Size
+Invoke-SqlQuery "SELECT name, value_in_use FROM sys.configurations WHERE name = 'network packet size (B)'"
+
+# Check Parameter Sniffing
+Invoke-SqlQuery "SELECT name, value_in_use FROM sys.configurations WHERE name = 'parameter sniffing'"
+
+# Check Instant File Initialization
+$ifiStatus = (Get-CimInstance -ClassName Win32_AccountPrivilege | Where-Object { $_.Privilege -eq "SeManageVolumePrivilege" })
+$ifiStatus
+
+# Check SQL Server Default Port
+Invoke-SqlQuery "EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\Microsoft SQL Server\\MSSQLServer\\SuperSocketNetLib\\Tcp', N'TcpPort'"
+
+# Check Physical RAM
+Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object TotalPhysicalMemory
+
+# Check CPU Info
+Get-CimInstance -ClassName Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+# Check Default Data, Log, and Backup Paths
+Invoke-SqlQuery "EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\Microsoft SQL Server\\MSSQLServer', N'DefaultData'"
+Invoke-SqlQuery "EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\Microsoft SQL Server\\MSSQLServer', N'DefaultLog'"
+Invoke-SqlQuery "EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\Microsoft SQL Server\\MSSQLServer', N'BackupDirectory'"
+
+# Check TempDB Details
+Invoke-SqlQuery "SELECT name, size, max_size, growth, physical_name FROM sys.master_files WHERE database_id = DB_ID('tempdb')"
+
+# Check Collation
+Invoke-SqlQuery "SELECT SERVERPROPERTY('Collation') AS ServerCollation"
+
+# Check Compatibility Level
+Invoke-SqlQuery "SELECT name, compatibility_level FROM sys.databases"
+
+# Check Disk Drives Present
+Get-PSDrive -PSProvider FileSystem
+
+# Verify and Register SPN for SQL Server
+Write-Host "Checking SPN Registration..."
+$spnQuery = "setspn -L $env:COMPUTERNAME"
+Invoke-Expression $spnQuery
+
+# Check SQL Server and Agent Logs for Errors
+Write-Host "Checking SQL Server Logs for Errors..."
+Invoke-SqlQuery "EXEC xp_readerrorlog 0, 1, 'error'"
+
+Write-Host "Checking SQL Agent Logs for Errors..."
+Invoke-SqlQuery "EXEC xp_readerrorlog 0, 2, 'error'"
+
+
+--- 4K
+
+
+# Define SQL Server instance
+$SQLServer = "DESKTOP-ODRPFI6"  # Change this to your SQL Server instance
+$Instance = "MSSQLSERVER"       # Change for named instances
+
+# Function to execute SQL Query
+Function Invoke-SqlQuery {
+    param (
+        [string]$Query
+    )
+    try {
+        Invoke-Sqlcmd -ServerInstance "$SQLServer" -Query $Query -ErrorAction Stop
+    } catch {
+        Write-Host "Error executing SQL query: $_" -ForegroundColor Red
+    }
+}
+
+# Function to check SQL Services
+Function Check-SQLServices {
+    Write-Host "`nChecking SQL Server services..."
+    Get-Service | Where-Object { $_.Name -like "MSSQL*" -or $_.Name -like "SQLAgent*" } | Format-Table Name, Status -AutoSize
+}
+
+# Function to check SQL Server configurations
+Function Check-SQLConfigurations {
+    Write-Host "`nChecking SQL Server configurations..."
+    $queries = @(
+        "SELECT name, value_in_use FROM sys.configurations WHERE name = 'max degree of parallelism'",
+        "SELECT name, value_in_use FROM sys.configurations WHERE name = 'cost threshold for parallelism'",
+        "SELECT name, value_in_use FROM sys.configurations WHERE name = 'optimize for ad hoc workloads'",
+        "SELECT name, value_in_use FROM sys.configurations WHERE name = 'network packet size (B)'",
+        "SELECT name, value_in_use FROM sys.configurations WHERE name = 'parameter sniffing'"
+    )
+    foreach ($query in $queries) {
+        Write-Host "Executing: $query"
+        Invoke-SqlQuery $query | Format-Table -AutoSize
+    }
+}
+
+# Function to check Instant File Initialization
+Function Check-InstantFileInitialization {
+    Write-Host "`nChecking Instant File Initialization..."
+    $ifiStatus = (Get-CimInstance -ClassName Win32_AccountPrivilege | Where-Object { $_.Privilege -eq "SeManageVolumePrivilege" })
+    if ($ifiStatus) {
+        Write-Host "Instant File Initialization is enabled." -ForegroundColor Green
+    } else {
+        Write-Host "Instant File Initialization is NOT enabled." -ForegroundColor Red
+    }
+}
+
+# Function to check SQL Server Default Port
+Function Check-DefaultPort {
+    Write-Host "`nChecking SQL Server Default Port..."
+    $portQuery = "EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\Microsoft SQL Server\\MSSQLServer\\SuperSocketNetLib\\Tcp\\IPAll', N'TcpPort'"
+    $port = Invoke-SqlQuery $portQuery
+    if ($port) {
+        Write-Host "Default Port: $($port.Data)" -ForegroundColor Green
+    } else {
+        Write-Host "Failed to retrieve default port." -ForegroundColor Red
+    }
+}
+
+# Function to check Physical RAM and CPU Info
+Function Check-SystemInfo {
+    Write-Host "`nChecking System Information..."
+    $ram = Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object TotalPhysicalMemory
+    $cpu = Get-CimInstance -ClassName Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+    Write-Host "Total Physical RAM: $([math]::round($ram.TotalPhysicalMemory / 1GB, 2)) GB" -ForegroundColor Green
+    Write-Host "CPU Info: $($cpu.Name), Cores: $($cpu.NumberOfCores), Logical Processors: $($cpu.NumberOfLogicalProcessors)" -ForegroundColor Green
+}
+
+# Function to check Default Data, Log, and Backup Paths
+Function Check-DefaultPaths {
+    Write-Host "`nChecking Default Data, Log, and Backup Paths..."
+    $paths = @(
+        "EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\Microsoft SQL Server\\MSSQLServer', N'DefaultData'",
+        "EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\Microsoft SQL Server\\MSSQLServer', N'DefaultLog'",
+        "EXEC xp_instance_regread N'HKEY_LOCAL_MACHINE', N'SOFTWARE\\Microsoft\\Microsoft SQL Server\\MSSQLServer', N'BackupDirectory'"
+    )
+    foreach ($pathQuery in $paths) {
+        $path = Invoke-SqlQuery $pathQuery
+        if ($path) {
+            Write-Host "$($path.Data)" -ForegroundColor Green
+        } else {
+            Write-Host "Failed to retrieve path." -ForegroundColor Red
+        }
+    }
+}
+
+# Function to check TempDB Details
+Function Check-TempDB {
+    Write-Host "`nChecking TempDB Details..."
+    $tempDBQuery = "SELECT name, size, max_size, growth, physical_name FROM sys.master_files WHERE database_id = DB_ID('tempdb')"
+    Invoke-SqlQuery $tempDBQuery | Format-Table -AutoSize
+}
+
+# Function to check Collation
+Function Check-Collation {
+    Write-Host "`nChecking Collation..."
+    $collationQuery = "SELECT SERVERPROPERTY('Collation') AS ServerCollation"
+    $collation = Invoke-SqlQuery $collationQuery
+    if ($collation) {
+        Write-Host "Server Collation: $($collation.ServerCollation)" -ForegroundColor Green
+    } else {
+        Write-Host "Failed to retrieve collation." -ForegroundColor Red
+    }
+}
+
+# Function to check Compatibility Level
+Function Check-CompatibilityLevel {
+    Write-Host "`nChecking Compatibility Level..."
+    $compatibilityQuery = "SELECT name, compatibility_level FROM sys.databases"
+    Invoke-SqlQuery $compatibilityQuery | Format-Table -AutoSize
+}
+
+# Function to check Disk Drives
+Function Check-DiskDrives {
+    Write-Host "`nChecking Disk Drives..."
+    Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, Used, Free -AutoSize
+}
+
+# Function to verify and register SPN for SQL Server
+Function Check-SPN {
+    Write-Host "`nChecking SPN Registration..."
+    $spnQuery = "setspn -L $env:COMPUTERNAME"
+    $spn = Invoke-Expression $spnQuery
+    if ($spn -like "*MSSQLSvc*") {
+        Write-Host "SPN is registered." -ForegroundColor Green
+    } else {
+        Write-Host "SPN is NOT registered. Registering SPN..." -ForegroundColor Red
+        setspn -A "MSSQLSvc/$SQLServer.$env:USERDNSDOMAIN" $env:COMPUTERNAME
+    }
+}
+
+# Function to check SQL Server and Agent Logs for Errors
+Function Check-ErrorLogs {
+    Write-Host "`nChecking SQL Server Logs for Errors..."
+    Invoke-SqlQuery "EXEC xp_readerrorlog 0, 1, 'error'" | Format-Table -AutoSize
+
+    Write-Host "`nChecking SQL Agent Logs for Errors..."
+    Invoke-SqlQuery "EXEC xp_readerrorlog 0, 2, 'error'" | Format-Table -AutoSize
+}
+
+# Main script execution
+Write-Host "SQL Server Health Check Script"
+Write-Host "=============================="
+
+# Execute all checks
+Check-SQLServices
+Check-SQLConfigurations
+Check-InstantFileInitialization
+Check-DefaultPort
+Check-SystemInfo
+Check-DefaultPaths
+Check-TempDB
+Check-Collation
+Check-CompatibilityLevel
+Check-DiskDrives
+Check-SPN
+Check-ErrorLogs
+
+Write-Host "`nScript execution completed." -ForegroundColor Green
+
+
