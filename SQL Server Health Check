@@ -1,0 +1,188 @@
+# PowerShell Script to Check SQL Server Configuration and Health
+
+# Load SQL Server module
+Import-Module SqlServer
+
+# Define SQL Server instance name
+$sqlInstance = "DESKTOP-ODRPFI6"  # Replace with your SQL Server instance name
+
+# Function to check SQL Server services
+function Check-SQLServices {
+    Write-Host "Checking SQL Server services..."
+    $services = Get-Service | Where-Object { $_.DisplayName -like "*SQL Server (*" }
+    
+    foreach ($service in $services) {
+        Write-Host "Service: $($service.DisplayName) - Status: $($service.Status)"
+    }
+}
+
+# Function to check SQL Server configuration
+function Check-SQLConfiguration {
+    Write-Host "`nChecking SQL Server configuration..."
+    
+    # Connect to SQL Server
+    $connectionString = "Server=$sqlInstance;Integrated Security=True"
+    $connection = New-Object System.Data.SqlClient.SqlConnection
+    $connection.ConnectionString = $connectionString
+    $connection.Open()
+
+    # Query to get configuration settings
+    $query = @"
+    -- Physical RAM
+    SELECT 
+        'Physical RAM (GB)' AS Configuration,
+        CAST(ROUND(physical_memory_kb / 1024.0 / 1024.0, 2) AS VARCHAR) AS Value,
+        NULL AS ValueInUse
+    FROM sys.dm_os_sys_info
+
+    UNION ALL
+
+    -- TempDB Details
+    SELECT 
+        'TempDB File Count' AS Configuration,
+        CAST(COUNT(*) AS VARCHAR) AS Value,
+        NULL AS ValueInUse
+    FROM tempdb.sys.database_files
+    WHERE type = 0
+
+    UNION ALL
+
+    -- Collation
+    SELECT 
+        'Collation' AS Configuration,
+        CAST(SERVERPROPERTY('Collation') AS VARCHAR) AS Value,
+        NULL AS ValueInUse
+
+    UNION ALL
+
+    -- Network Packet Size
+    SELECT 
+        'Network Packet Size' AS Configuration,
+        CAST(value AS VARCHAR) AS Value,
+        CAST(value_in_use AS VARCHAR) AS ValueInUse
+    FROM sys.configurations
+    WHERE name = 'network packet size (B)'
+
+    UNION ALL
+
+    -- Cost Threshold for Parallelism
+    SELECT 
+        'Cost Threshold for Parallelism' AS Configuration,
+        CAST(value AS VARCHAR) AS Value,
+        CAST(value_in_use AS VARCHAR) AS ValueInUse
+    FROM sys.configurations
+    WHERE name = 'cost threshold for parallelism'
+
+    UNION ALL
+
+    -- Compatibility Level
+    SELECT 
+        'Compatibility Level' AS Configuration,
+        CAST(compatibility_level AS VARCHAR) AS Value,
+        NULL AS ValueInUse
+    FROM sys.databases
+    WHERE name = 'tempdb'
+
+    UNION ALL
+
+    -- Parameter Sniffing
+    SELECT 
+        'Parameter Sniffing' AS Configuration,
+        CASE WHEN value = 1 THEN 'Enabled' ELSE 'Disabled' END AS Value,
+        NULL AS ValueInUse
+    FROM sys.configurations
+    WHERE name = 'parameter sniffing'
+
+    UNION ALL
+
+    -- Default Port
+    SELECT 
+        'Default Port' AS Configuration,
+        CAST(local_tcp_port AS VARCHAR) AS Value,
+        NULL AS ValueInUse
+    FROM sys.dm_exec_connections
+    WHERE session_id = @@SPID
+
+    UNION ALL
+
+    -- Disk Drives
+    SELECT 
+        'Disk Drive' AS Configuration,
+        volume_mount_point AS Value,
+        CAST(CAST(available_bytes / 1024.0 / 1024.0 / 1024.0 AS DECIMAL(10, 2)) AS VARCHAR) + ' GB' AS ValueInUse
+    FROM sys.dm_os_volume_stats(DB_ID(), NULL)
+"@
+
+    $command = $connection.CreateCommand()
+    $command.CommandText = $query
+    $reader = $command.ExecuteReader()
+
+    # Display configuration settings
+    Write-Host "`nSQL Server Configuration:"
+    while ($reader.Read()) {
+        Write-Host "$($reader["Configuration"]): $($reader["Value"]) (Value in Use: $($reader["ValueInUse"]))"
+    }
+
+    $reader.Close()
+    $connection.Close()
+}
+
+# Function to verify and register SPN for SQL Server
+function Check-SPN {
+    Write-Host "`nVerifying SPN for SQL Server..."
+    $spn = setspn -L $env:COMPUTERNAME
+    if ($spn -like "*MSSQLSvc*") {
+        Write-Host "SPN is registered."
+    } else {
+        Write-Host "SPN is NOT registered. Registering SPN..."
+        setspn -A "MSSQLSvc/$sqlInstance" $env:COMPUTERNAME
+    }
+}
+
+# Function to check SQL Server and Agent logs for errors
+function Check-ErrorLogs {
+    Write-Host "`nChecking SQL Server and Agent logs for errors..."
+    
+    # Connect to SQL Server
+    $connectionString = "Server=$sqlInstance;Integrated Security=True"
+    $connection = New-Object System.Data.SqlClient.SqlConnection
+    $connection.ConnectionString = $connectionString
+    $connection.Open()
+
+    # Query to get error logs
+    $query = @"
+    EXEC xp_readerrorlog 0, 1, N'error'
+    EXEC xp_readerrorlog 1, 1, N'error'
+"@
+
+    $command = $connection.CreateCommand()
+    $command.CommandText = $query
+    $reader = $command.ExecuteReader()
+
+    # Display error logs
+    Write-Host "`nSQL Server Error Logs:"
+    while ($reader.Read()) {
+        Write-Host "$($reader["LogDate"]) $($reader["ProcessInfo"]) $($reader["Text"])"
+    }
+
+    $reader.Close()
+    $connection.Close()
+}
+
+# Main script execution
+Write-Host "SQL Server Health Check Script"
+Write-Host "=============================="
+
+# Check SQL Server services
+Check-SQLServices
+
+# Check SQL Server configuration
+Check-SQLConfiguration
+
+# Verify and register SPN
+Check-SPN
+
+# Check error logs
+Check-ErrorLogs
+
+Write-Host "`nScript execution completed."
