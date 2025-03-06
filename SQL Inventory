@@ -1,0 +1,165 @@
+-- ===========================================
+-- 📋 SQL Server Inventory Script with OS Version
+-- ===========================================
+
+-- Create a temporary table to store results
+IF OBJECT_ID('tempdb..#SQLServerInventory') IS NOT NULL
+    DROP TABLE #SQLServerInventory;
+
+CREATE TABLE #SQLServerInventory (
+    [Section] NVARCHAR(50),
+    [Item] NVARCHAR(100),
+    [Value] NVARCHAR(MAX),
+    [Environment] NVARCHAR(50) NULL,  -- Column for environment type (Prod/Dev/UAT)
+    [BusinessOwner] NVARCHAR(50) NULL -- Column for Business Owner
+);
+
+-- ==============================
+-- 1️⃣ Collect Server-Level Information (CPU, Memory, OS, etc.)
+-- ==============================
+INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+SELECT 'Server Info', 'Server Name', CONVERT(NVARCHAR, SERVERPROPERTY('MachineName')), 'Prod', 'Ketan' UNION ALL
+SELECT 'Server Info', 'SQL Server Version', CONVERT(NVARCHAR, SERVERPROPERTY('ProductVersion')), 'Prod', 'Ketan' UNION ALL
+SELECT 'Server Info', 'Service Pack Level', CONVERT(NVARCHAR, SERVERPROPERTY('ProductLevel')), 'Prod', 'Ketan' UNION ALL
+SELECT 'Server Info', 'SQL Server Edition', CONVERT(NVARCHAR, SERVERPROPERTY('Edition')), 'Prod', 'Ketan' UNION ALL
+SELECT 'Server Info', 'Is Clustered', IIF(SERVERPROPERTY('IsClustered') = 1, 'Yes', 'No'), 'Prod', 'Ketan' UNION ALL
+SELECT 'Server Info', 'Is Always On Enabled', IIF(SERVERPROPERTY('IsHadrEnabled') = 1, 'Yes', 'No'), 'Prod', 'Ketan' UNION ALL
+SELECT 'Server Info', 'Collation', CONVERT(NVARCHAR, SERVERPROPERTY('Collation')), 'Prod', 'Ketan' UNION ALL
+SELECT 'Server Info', 'Is Full-Text Installed', IIF(SERVERPROPERTY('IsFullTextInstalled') = 1, 'Yes', 'No'), 'Prod', 'Ketan' UNION ALL
+-- Use SERVERPROPERTY('OSVersion') to get the OS version
+SELECT 'Server Info', 'Operating System', CONVERT(NVARCHAR, SERVERPROPERTY('OSVersion')), 'Prod', 'Ketan';
+
+-- ==============================
+-- 2️⃣ Collect Server Hardware Info (CPU, Physical Memory)
+-- ==============================
+BEGIN TRY
+    INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+    SELECT 'Server Info', 'CPU Cores', CONVERT(NVARCHAR, cpu_count), 'Prod', 'Ketan' FROM sys.dm_os_sys_info UNION ALL
+    -- Use total_physical_memory_kb for physical memory size (in KB), then convert it to MB
+    SELECT 'Server Info', 'Physical Memory (MB)', CONVERT(NVARCHAR, (total_physical_memory_kb / 1024)), 'Prod', 'Ketan'
+    FROM sys.dm_os_sys_memory;  -- Use this DMV for memory size
+END TRY
+BEGIN CATCH
+    -- Fallback in case an error occurs
+    INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+    SELECT 'Server Info', 'CPU Cores', CONVERT(NVARCHAR, cpu_count), 'Prod', 'Ketan' FROM sys.dm_os_sys_info UNION ALL
+    SELECT 'Server Info', 'Physical Memory (MB)', 'Unknown', 'Prod', 'Ketan';  -- If failed, mark as 'Unknown'
+END CATCH;
+
+-- ==============================
+-- 3️⃣ Collect SQL Server Memory Config (Min/Max)
+-- ==============================
+INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+SELECT 'Server Info', 'SQL Server Min Memory (MB)', CONVERT(NVARCHAR, CONVERT(INT, value_in_use) / 1024), 'Prod', 'Ketan' 
+FROM sys.configurations
+WHERE name = 'min server memory (MB)' UNION ALL
+SELECT 'Server Info', 'SQL Server Max Memory (MB)', CONVERT(NVARCHAR, CONVERT(INT, value_in_use) / 1024), 'Prod', 'Ketan' 
+FROM sys.configurations
+WHERE name = 'max server memory (MB)';
+
+-- ==============================
+-- 4️⃣ Collect MaxDOP and Cost Threshold for Parallelism
+-- ==============================
+INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+SELECT 'Server Info', 'MaxDOP', CONVERT(NVARCHAR, value_in_use), 'Prod', 'Ketan' 
+FROM sys.configurations
+WHERE name = 'max degree of parallelism' UNION ALL
+SELECT 'Server Info', 'Cost Threshold for Parallelism', CONVERT(NVARCHAR, value_in_use), 'Prod', 'Ketan' 
+FROM sys.configurations
+WHERE name = 'cost threshold for parallelism';
+
+-- ==============================
+-- 5️⃣ Collect All Databases in One Column (Using FOR XML PATH)
+-- ==============================
+DECLARE @AllDatabases NVARCHAR(MAX);
+
+-- Concatenate all database names into one string using FOR XML PATH
+SELECT @AllDatabases = STUFF(( 
+    SELECT ', ' + name
+    FROM sys.databases
+    WHERE state = 0  -- Only include ONLINE databases
+    FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, '');
+
+-- Insert concatenated databases into the temp table
+INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+VALUES ('Database Info', 'All Databases', @AllDatabases, 'Prod', 'Ketan');
+
+-- ==============================
+-- 6️⃣ Get Current Patch and Configuration Details
+-- ==============================
+INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+SELECT 'Patch Info', 'Current CU/Hotfix Level', CONVERT(NVARCHAR, SERVERPROPERTY('ProductUpdateLevel')), 'Prod', 'Ketan' UNION ALL
+SELECT 'Patch Info', 'Current Build', CONVERT(NVARCHAR, SERVERPROPERTY('ProductBuild')), 'Prod', 'Ketan' UNION ALL
+SELECT 'Patch Info', 'Resource DB Version', CONVERT(NVARCHAR, SERVERPROPERTY('ResourceVersion')), 'Prod', 'Ketan' UNION ALL
+SELECT 'Patch Info', 'Resource DB Last Update', CONVERT(NVARCHAR, SERVERPROPERTY('ResourceLastUpdateDateTime'), 120), 'Prod', 'Ketan';
+
+-- ==============================
+-- 7️⃣ Extract SQL Server Major and Minor Versions
+-- ==============================
+DECLARE @Version NVARCHAR(128) = CONVERT(NVARCHAR, SERVERPROPERTY('ProductVersion'));
+DECLARE @MajorVersion INT = LEFT(@Version, CHARINDEX('.', @Version) - 1);
+
+-- Insert into temporary table
+INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+VALUES ('Version Info', 'Major Version', CAST(@MajorVersion AS NVARCHAR), 'Prod', 'Ketan');
+
+-- ==============================
+-- 8️⃣ Suggest Latest (n-1) Patch Based on Version
+-- ==============================
+DECLARE @PatchInfo TABLE (
+    MajorVersion INT,
+    LatestPatch NVARCHAR(50),
+    LatestBuild NVARCHAR(50)
+);
+
+-- Add entries for various SQL Server versions
+INSERT INTO @PatchInfo (MajorVersion, LatestPatch, LatestBuild)
+VALUES 
+(11, 'SP4 CU2', '11.0.7462.6'),   -- SQL Server 2012
+(12, 'SP4 CU3', '12.0.6329.1'),   -- SQL Server 2014
+(13, 'SP3 CU4', '13.0.6390.2'),   -- SQL Server 2016
+(14, 'SP2 CU16', '14.0.3421.10'), -- SQL Server 2017
+(15, 'CU24', '15.0.4261.1'),      -- SQL Server 2019
+(16, 'CU7', '16.0.4075.1');       -- SQL Server 2022
+
+-- Suggest latest (n-1) patch
+INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+SELECT 'Patch Suggestion', 'Suggested Latest (n-1) Patch', LatestPatch, 'Prod', 'Ketan' 
+FROM @PatchInfo WHERE MajorVersion = @MajorVersion;
+
+INSERT INTO #SQLServerInventory ([Section], [Item], [Value], [Environment], [BusinessOwner])
+SELECT 'Patch Suggestion', 'Suggested Build', LatestBuild, 'Prod', 'Ketan' 
+FROM @PatchInfo WHERE MajorVersion = @MajorVersion;
+
+-- ==============================
+-- 9️⃣ Pivot Data for Horizontal Output
+-- ==============================
+DECLARE @Columns NVARCHAR(MAX) = '';
+DECLARE @SQL NVARCHAR(MAX) = '';
+
+-- Dynamically generate column names
+SELECT @Columns += QUOTENAME([Item]) + ',' 
+FROM #SQLServerInventory
+GROUP BY [Item]
+ORDER BY [Item];
+
+SET @Columns = LEFT(@Columns, LEN(@Columns) - 1); -- Remove trailing comma
+
+-- Generate dynamic SQL for pivot
+SET @SQL = '
+SELECT * 
+FROM (
+    SELECT [Item], [Value], [Environment], [BusinessOwner]
+    FROM #SQLServerInventory
+) AS SourceTable
+PIVOT (
+    MAX([Value]) 
+    FOR [Item] IN (' + @Columns + ')
+) AS PivotTable;
+';
+
+-- Execute dynamic SQL to display results
+EXEC sp_executesql @SQL;
+
+-- Cleanup
+DROP TABLE #SQLServerInventory;
