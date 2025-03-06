@@ -1,0 +1,117 @@
+-- Server-Level Information with OS, CPU, and Memory
+SELECT 
+    SERVERPROPERTY('MachineName') AS [Machine Name],
+    SERVERPROPERTY('ServerName') AS [Server Name],
+    SERVERPROPERTY('ProductVersion') AS [Product Version],
+    SERVERPROPERTY('ProductLevel') AS [Product Level],
+    SERVERPROPERTY('Edition') AS [Edition],
+    SERVERPROPERTY('EngineEdition') AS [Engine Edition],
+    SERVERPROPERTY('IsClustered') AS [Is Clustered],
+    SERVERPROPERTY('IsIntegratedSecurityOnly') AS [Is Integrated Security Only],
+    SERVERPROPERTY('IsHadrEnabled') AS [Is HADR Enabled],
+    SERVERPROPERTY('Collation') AS [Collation],
+    SERVERPROPERTY('IsFullTextInstalled') AS [Is Full Text Installed],
+    SERVERPROPERTY('IsXTPSupported') AS [Is XTP Supported],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'max degree of parallelism') AS [MaxDOP],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'cost threshold for parallelism') AS [Cost Threshold for Parallelism],
+    CAST(SERVERPROPERTY('ProductMajorVersion') AS NVARCHAR(128)) + '.' + CAST(SERVERPROPERTY('ProductMinorVersion') AS NVARCHAR(128)) AS [SQL Server Version],
+    cpu_count AS [CPU Count],
+    physical_memory_kb / 1024 AS [Physical Memory (MB)]
+FROM sys.dm_os_sys_info;
+
+-- Database-Level Information with Recovery Model and Backup Details
+SELECT 
+    d.name AS [Database Name],
+    d.state_desc AS [State],
+    d.recovery_model_desc AS [Recovery Model],
+    d.compatibility_level AS [Compatibility Level],
+    d.containment_desc AS [Containment Type],
+    d.collation_name AS [Collation],
+    'Prod' AS [Environment], -- Placeholder value, update with actual environment information
+    SUSER_SNAME(d.owner_sid) AS [Owner],
+    (SELECT TOP 1 b.backup_finish_date 
+     FROM msdb.dbo.backupset b 
+     WHERE b.database_name = d.name 
+     ORDER BY b.backup_finish_date DESC) AS [Last Backup Date]
+FROM sys.databases d;
+
+-- Current Patch and Configuration Details
+EXEC xp_msver;
+
+-- Get Windows OS Information
+EXEC xp_cmdshell 'systeminfo';
+
+-- SQL Server Major and Minor Versions
+SELECT 
+    SERVERPROPERTY('ProductMajorVersion') AS [Major Version],
+    SERVERPROPERTY('ProductMinorVersion') AS [Minor Version];
+
+-- Suggest Latest (n-1) Patch Based on SQL Database Version
+DECLARE @CurrentVersion NVARCHAR(128);
+SET @CurrentVersion = CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128));
+SELECT @CurrentVersion AS [Current Version], 
+    CASE 
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '11%' THEN 'SQL Server 2012 SP4 CU16 (12.0.6024.0)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '12%' THEN 'SQL Server 2014 SP3 CU4 (12.0.6179.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '13%' THEN 'SQL Server 2016 SP3 CU17 (13.0.6455.2)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '14%' THEN 'SQL Server 2017 CU31 (14.0.3485.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '15%' THEN 'SQL Server 2019 CU32 (15.0.4430.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '16%' THEN 'SQL Server 2022 CU17 (16.0.4175.1)'
+        ELSE 'Unknown version'
+    END AS [Suggested Patch];
+
+-- Summary View
+SELECT 
+    SERVERPROPERTY('MachineName') AS [Machine Name],
+    SERVERPROPERTY('ServerName') AS [Server Name],
+    d.name AS [Database Name],
+    SERVERPROPERTY('ProductVersion') AS [Product Version],
+    SERVERPROPERTY('ProductMajorVersion') AS [Major Version],
+    SERVERPROPERTY('ProductMinorVersion') AS [Minor Version],
+    CASE 
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '11%' THEN 'SQL Server 2012 SP4 CU16 (12.0.6024.0)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '12%' THEN 'SQL Server 2014 SP3 CU4 (12.0.6179.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '13%' THEN 'SQL Server 2016 SP3 CU17 (13.0.6455.2)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '14%' THEN 'SQL Server 2017 CU31 (14.0.3485.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '15%' THEN 'SQL Server 2019 CU32 (15.0.4430.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '16%' THEN 'SQL Server 2022 CU17 (16.0.4175.1)'
+        ELSE 'Unknown version'
+    END AS [Suggested Patch],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'max degree of parallelism') AS [MaxDOP],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'cost threshold for parallelism') AS [Cost Threshold for Parallelism],
+    'Prod' AS [Environment], -- Placeholder value, update with actual environment information
+    SUSER_SNAME(d.owner_sid) AS [Owner],
+    (SELECT TOP 1 b.backup_finish_date 
+     FROM msdb.dbo.backupset b 
+     WHERE b.database_name = d.name 
+     ORDER BY b.backup_finish_date DESC) AS [Last Backup Date],
+    cpu_count AS [CPU Count],
+    physical_memory_kb / 1024 AS [Physical Memory (MB)],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'min server memory (MB)') AS [Min Server Memory],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'max server memory (MB)') AS [Max Server Memory]
+FROM sys.databases d
+JOIN sys.dm_os_sys_info si ON 1=1;
+
+-- Export as CSV
+SELECT 
+    SERVERPROPERTY('MachineName') AS [Machine Name],
+    SERVERPROPERTY('ServerName') AS [Server Name],
+    d.name AS [Database Name],
+    d.state_desc AS [State],
+    d.recovery_model_desc AS [Recovery Model],
+    d.compatibility_level AS [Compatibility Level],
+    d.containment_desc AS [Containment Type],
+    d.collation_name AS [Collation],
+    SERVERPROPERTY('ProductVersion') AS [Product Version],
+    SERVERPROPERTY('ProductMajorVersion') AS [Major Version],
+    SERVERPROPERTY('ProductMinorVersion') AS [Minor Version],
+    CASE 
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '11%' THEN 'SQL Server 2012 SP4 CU16 (12.0.6024.0)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '12%' THEN 'SQL Server 2014 SP3 CU4 (12.0.6179.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '13%' THEN 'SQL Server 2016 SP3 CU17 (13.0.6455.2)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '14%' THEN 'SQL Server 2017 CU31 (14.0.3485.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '15%' THEN 'SQL Server 2019 CU32 (15.0.4430.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '16%' THEN 'SQL Server 2022 CU17 (16.0.4175.1)'
+        ELSE 'Unknown version'
+    END AS [Suggested Patch]
+FROM sys.databases d;
