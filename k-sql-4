@@ -24,7 +24,7 @@ SELECT
     SERVERPROPERTY('ServerName') AS [Server Name],
     @DatabaseNames AS [Database Names],
     -- Get containment type from sys.databases
-    (SELECT DISTINCT containment_desc 
+    (SELECT TOP 1 containment_desc 
      FROM sys.databases WHERE name IN (SELECT name FROM sys.databases)) AS [Containment Type],
     @WindowsOS AS [Windows OS],
     SERVERPROPERTY('Collation') AS [Collation],
@@ -58,8 +58,16 @@ SELECT
     SERVERPROPERTY('IsHadrEnabled') AS [Is HADR Enabled],
     SERVERPROPERTY('IsFullTextInstalled') AS [Is Full Text Installed],
     SERVERPROPERTY('IsXTPSupported') AS [Is XTP Supported],
-    -- Get Availability Group details
-    (SELECT name FROM sys.availability_groups) AS [Availability Group],
-    (SELECT replica_server_name FROM sys.availability_replicas) AS [AG Replica Servers],
-    (SELECT dns_name FROM sys.availability_group_listeners) AS [AG Listener DNS Name],
-    (SELECT ip_address FROM sys.availability_group_listener_ip_addresses) AS [AG Listener IP Address];
+    -- Get Availability Group details concatenated into a single string
+    (SELECT name + ', ' 
+     FROM sys.availability_groups 
+     FOR XML PATH('')) AS [Availability Group],
+    (SELECT replica_server_name + ', ' 
+     FROM sys.availability_replicas 
+     FOR XML PATH('')) AS [AG Replica Servers],
+    (SELECT dns_name + ', ' 
+     FROM sys.availability_group_listeners 
+     FOR XML PATH('')) AS [AG Listener DNS Name],
+    (SELECT ip_address + ', ' 
+     FROM sys.availability_group_listener_ip_addresses 
+     FOR XML PATH('')) AS [AG Listener IP Address];
