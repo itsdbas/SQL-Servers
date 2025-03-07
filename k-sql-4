@@ -1,123 +1,58 @@
--- Create a temporary table to store results from all servers
-CREATE TABLE #ServerInfo (
-    Environment NVARCHAR(50),
-    Owner NVARCHAR(50),
-    ServerName NVARCHAR(128),
-    DatabaseNames NVARCHAR(MAX),
-    ContainmentType NVARCHAR(50),
-    WindowsOS NVARCHAR(2000),
-    Collation NVARCHAR(128),
-    Edition NVARCHAR(50),
-    EngineEdition NVARCHAR(50),
-    MaxDOP INT,
-    CostThresholdForParallelism INT,
-    ProductLevel NVARCHAR(50),
-    ProductVersion NVARCHAR(50),
-    MajorVersion NVARCHAR(50),
-    MinorVersion NVARCHAR(50),
-    SuggestedPatch NVARCHAR(50),
-    LastBackupDate DATETIME,
-    CPUCount INT,
-    PhysicalMemoryMB INT,
-    MinServerMemory INT,
-    MaxServerMemory INT,
-    IsClustered NVARCHAR(50),
-    IsIntegratedSecurityOnly NVARCHAR(50),
-    IsHadrEnabled NVARCHAR(50),
-    IsFullTextInstalled NVARCHAR(50),
-    IsXTPSupported NVARCHAR(50),
-    AvailabilityGroup NVARCHAR(128),
-    AGReplicaServers NVARCHAR(128),
-    AGListenerDNSName NVARCHAR(128),
-    AGListenerIPAddress NVARCHAR(128)
-);
 
--- Iterate over each registered server in CMS
-DECLARE @ServerName NVARCHAR(128);
 
-DECLARE server_cursor CURSOR FOR
-SELECT DISTINCT server_name
-FROM msdb.dbo.sysmanagement_shared_registered_servers_internal;
+-- Declare a variable to hold the database names
+DECLARE @DatabaseNames NVARCHAR(MAX);
 
-OPEN server_cursor;
-FETCH NEXT FROM server_cursor INTO @ServerName;
+-- Concatenate all database names into a single string
+SELECT @DatabaseNames = COALESCE(@DatabaseNames + ', ', '') + name
+FROM sys.databases;
 
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    -- Dynamically construct the query to execute on each server
-    DECLARE @SQL NVARCHAR(MAX) = '
-        DECLARE @DatabaseNames NVARCHAR(MAX);
-        DECLARE @FullVersionInfo NVARCHAR(2000);
-        DECLARE @WindowsOS NVARCHAR(2000);
-
-        SELECT @DatabaseNames = COALESCE(@DatabaseNames + '', '', '''') + name
-        FROM sys.databases;
-
-        SET @FullVersionInfo = @@VERSION;
-
-        SET @WindowsOS = SUBSTRING(
-            @FullVersionInfo,
-            CHARINDEX('' on '', @FullVersionInfo) + 4,
-            LEN(@FullVersionInfo) - CHARINDEX('' on '', @FullVersionInfo) + 4
-        );
-
-        SELECT 
-            ''Prod'' AS [Environment], 
-            ''DBA Team'' AS [Owner],
-            SERVERPROPERTY(''ServerName'') AS [ServerName],
-            @DatabaseNames AS [DatabaseNames],
-            (SELECT DISTINCT containment_desc 
-             FROM sys.databases WHERE name IN (SELECT name FROM sys.databases)) AS [ContainmentType],
-            @WindowsOS AS [WindowsOS],
-            SERVERPROPERTY(''Collation'') AS [Collation],
-            SERVERPROPERTY(''Edition'') AS [Edition],
-            SERVERPROPERTY(''EngineEdition'') AS [EngineEdition],
-            (SELECT value_in_use FROM sys.configurations WHERE name = ''max degree of parallelism'') AS [MaxDOP],
-            (SELECT value_in_use FROM sys.configurations WHERE name = ''cost threshold for parallelism'') AS [CostThresholdForParallelism],
-            SERVERPROPERTY(''ProductLevel'') AS [ProductLevel],
-            SERVERPROPERTY(''ProductVersion'') AS [ProductVersion],
-            SERVERPROPERTY(''ProductMajorVersion'') AS [MajorVersion],
-            SERVERPROPERTY(''ProductMinorVersion'') AS [MinorVersion],
-            CASE 
-                WHEN CAST(SERVERPROPERTY(''ProductVersion'') AS NVARCHAR(128)) LIKE ''11%'' THEN ''SQL Server 2012 SP4 CU16 (12.0.6024.0)''
-                WHEN CAST(SERVERPROPERTY(''ProductVersion'') AS NVARCHAR(128)) LIKE ''12%'' THEN ''SQL Server 2014 SP3 CU4 (12.0.6179.1)''
-                WHEN CAST(SERVERPROPERTY(''ProductVersion'') AS NVARCHAR(128)) LIKE ''13%'' THEN ''SQL Server 2016 SP3 CU17 (13.0.6455.2)''
-                WHEN CAST(SERVERPROPERTY(''ProductVersion'') AS NVARCHAR(128)) LIKE ''14%'' THEN ''SQL Server 2017 CU31 (14.0.3485.1)''
-                WHEN CAST(SERVERPROPERTY(''ProductVersion'') AS NVARCHAR(128)) LIKE ''15%'' THEN ''SQL Server 2019 CU32 (15.0.4430.1)''
-                WHEN CAST(SERVERPROPERTY(''ProductVersion'') AS NVARCHAR(128)) LIKE ''16%'' THEN ''SQL Server 2022 CU17 (16.0.4175.1)''
-                ELSE ''Unknown version''
-            END AS [SuggestedPatch],
-            (SELECT TOP 1 backup_finish_date 
-             FROM msdb.dbo.backupset 
-             WHERE database_name = ''master''
-             ORDER BY backup_finish_date DESC) AS [LastBackupDate],
-            (SELECT cpu_count FROM sys.dm_os_sys_info) AS [CPUCount],
-            (SELECT physical_memory_kb / 1024 FROM sys.dm_os_sys_info) AS [PhysicalMemoryMB],
-            (SELECT value_in_use FROM sys.configurations WHERE name = ''min server memory (MB)'') AS [MinServerMemory],
-            (SELECT value_in_use FROM sys.configurations WHERE name = ''max server memory (MB)'') AS [MaxServerMemory],
-            SERVERPROPERTY(''IsClustered'') AS [IsClustered],
-            SERVERPROPERTY(''IsIntegratedSecurityOnly'') AS [IsIntegratedSecurityOnly],
-            SERVERPROPERTY(''IsHadrEnabled'') AS [IsHadrEnabled],
-            SERVERPROPERTY(''IsFullTextInstalled'') AS [IsFullTextInstalled],
-            SERVERPROPERTY(''IsXTPSupported'') AS [IsXTPSupported],
-            (SELECT name FROM sys.availability_groups) AS [AvailabilityGroup],
-            (SELECT replica_server_name FROM sys.availability_replicas) AS [AGReplicaServers],
-            (SELECT dns_name FROM sys.availability_group_listeners) AS [AGListenerDNSName],
-            (SELECT ip_address FROM sys.availability_group_listener_ip_addresses) AS [AGListenerIPAddress];
-    ';
-
-    -- Execute the query on the current server and insert the results into the temporary table
-    INSERT INTO #ServerInfo
-    EXEC (@SQL) AT @ServerName;
-
-    FETCH NEXT FROM server_cursor INTO @ServerName;
-END
-
-CLOSE server_cursor;
-DEALLOCATE server_cursor;
-
--- Select the results from the temporary table
-SELECT * FROM #ServerInfo;
-
--- Drop the temporary table
-DROP TABLE #ServerInfo;
+-- Select server and database properties
+SELECT 
+    'Prod' AS [Environment], 
+    'DBA Team' AS [Owner],
+    SERVERPROPERTY('ServerName') AS [Server Name],
+    @DatabaseNames AS [Database Names],
+    -- Get containment type from sys.databases
+    (SELECT DISTINCT containment_desc 
+     FROM sys.databases WHERE name IN (SELECT name FROM sys.databases)) AS [Containment Type],
+    -- Fetch operating system details
+    (SELECT SUBSTRING(@@VERSION, CHARINDEX('Windows NT', @@VERSION), 50)) AS [Windows OS],
+    SERVERPROPERTY('Collation') AS [Collation],
+    SERVERPROPERTY('Edition') AS [Edition],
+    SERVERPROPERTY('EngineEdition') AS [Engine Edition],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'max degree of parallelism') AS [MaxDOP],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'cost threshold for parallelism') AS [Cost Threshold for Parallelism],
+    SERVERPROPERTY('ProductLevel') AS [Product Level],
+    SERVERPROPERTY('ProductVersion') AS [Product Version],
+    SERVERPROPERTY('ProductMajorVersion') AS [Major Version],
+    SERVERPROPERTY('ProductMinorVersion') AS [Minor Version],
+    CASE 
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '11%' THEN 'SQL Server 2012 SP4 CU16 (12.0.6024.0)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '12%' THEN 'SQL Server 2014 SP3 CU4 (12.0.6179.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '13%' THEN 'SQL Server 2016 SP3 CU17 (13.0.6455.2)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '14%' THEN 'SQL Server 2017 CU31 (14.0.3485.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '15%' THEN 'SQL Server 2019 CU32 (15.0.4430.1)'
+        WHEN CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(128)) LIKE '16%' THEN 'SQL Server 2022 CU17 (16.0.4175.1)'
+        ELSE 'Unknown version'
+    END AS [Suggested Patch],
+    (SELECT TOP 1 backup_finish_date 
+     FROM msdb.dbo.backupset 
+     WHERE database_name = 'master'
+     ORDER BY backup_finish_date DESC) AS [Last Backup Date],
+    (SELECT cpu_count FROM sys.dm_os_sys_info) AS [CPU Count],
+    (SELECT physical_memory_kb / 1024 FROM sys.dm_os_sys_info) AS [Physical Memory (MB)],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'min server memory (MB)') AS [Min Server Memory],
+    (SELECT value_in_use FROM sys.configurations WHERE name = 'max server memory (MB)') AS [Max Server Memory],
+    SERVERPROPERTY('IsClustered') AS [Is Clustered],
+    SERVERPROPERTY('IsIntegratedSecurityOnly') AS [Is Integrated Security Only],
+    SERVERPROPERTY('IsHadrEnabled') AS [Is HADR Enabled],
+    SERVERPROPERTY('IsFullTextInstalled') AS [Is Full Text Installed],
+    SERVERPROPERTY('IsXTPSupported') AS [Is XTP Supported],
+    -- Get Availability Group name
+    (SELECT name FROM sys.availability_groups) AS [Availability Group],
+    -- Get Availability Group replica server names
+    (SELECT replica_server_name FROM sys.availability_replicas) AS [AG Replica Servers],
+    -- Get Availability Group listener DNS name and IP address details
+    (SELECT dns_name FROM sys.availability_group_listeners) AS [AG Listener DNS Name],
+    (SELECT ip_address FROM sys.availability_group_listener_ip_addresses) AS [AG Listener IP Address];
