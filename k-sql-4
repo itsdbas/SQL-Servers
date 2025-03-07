@@ -1,11 +1,21 @@
-
-
--- Declare a variable to hold the database names
+-- Declare variables to hold the database names and OS details
 DECLARE @DatabaseNames NVARCHAR(MAX);
+DECLARE @FullVersionInfo NVARCHAR(2000);
+DECLARE @WindowsOS NVARCHAR(2000);
 
 -- Concatenate all database names into a single string
 SELECT @DatabaseNames = COALESCE(@DatabaseNames + ', ', '') + name
 FROM sys.databases;
+
+-- Get the full version information
+SET @FullVersionInfo = @@VERSION;
+
+-- Extract the Windows OS information
+SET @WindowsOS = SUBSTRING(
+    @FullVersionInfo,
+    CHARINDEX(' on ', @FullVersionInfo) + 4,
+    LEN(@FullVersionInfo) - CHARINDEX(' on ', @FullVersionInfo) + 4
+);
 
 -- Select server and database properties
 SELECT 
@@ -16,8 +26,7 @@ SELECT
     -- Get containment type from sys.databases
     (SELECT DISTINCT containment_desc 
      FROM sys.databases WHERE name IN (SELECT name FROM sys.databases)) AS [Containment Type],
-    -- Fetch operating system details
-    (SELECT SUBSTRING(@@VERSION, CHARINDEX('Windows NT', @@VERSION), 50)) AS [Windows OS],
+    @WindowsOS AS [Windows OS],
     SERVERPROPERTY('Collation') AS [Collation],
     SERVERPROPERTY('Edition') AS [Edition],
     SERVERPROPERTY('EngineEdition') AS [Engine Edition],
@@ -49,10 +58,8 @@ SELECT
     SERVERPROPERTY('IsHadrEnabled') AS [Is HADR Enabled],
     SERVERPROPERTY('IsFullTextInstalled') AS [Is Full Text Installed],
     SERVERPROPERTY('IsXTPSupported') AS [Is XTP Supported],
-    -- Get Availability Group name
+    -- Get Availability Group details
     (SELECT name FROM sys.availability_groups) AS [Availability Group],
-    -- Get Availability Group replica server names
     (SELECT replica_server_name FROM sys.availability_replicas) AS [AG Replica Servers],
-    -- Get Availability Group listener DNS name and IP address details
     (SELECT dns_name FROM sys.availability_group_listeners) AS [AG Listener DNS Name],
     (SELECT ip_address FROM sys.availability_group_listener_ip_addresses) AS [AG Listener IP Address];
