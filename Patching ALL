@@ -1,0 +1,62 @@
+SQL Server Database Patching Checklist
+Pre-Patching Checks (Preparation Phase)
+1.	Approval & Planning
+o	Obtain necessary approvals from business and stakeholders.
+o	Schedule patching during the maintenance window.
+o	Check for compatibility of the patch with SQL Server version and applications.
+2.	Backup & Recovery Readiness
+o	Take full database backups (FULL, DIFF, T-LOG).
+o	Backup master, msdb, model, and tempdb databases.
+o	Backup SQL Server configuration (sp_configure settings, sys.dm_server_registry).
+o	Backup SQL Agent Jobs, Linked Servers, and SSIS packages.
+o	Snapshot/Backup OS and SQL Server binaries if VM-based.
+3.	Check Current System Health
+o	Verify database consistency (DBCC CHECKDB).
+o	Run performance baseline reports (CPU, memory, disk I/O).
+o	Capture running queries and active sessions (sp_who2, sys.dm_exec_requests).
+o	Check SQL Server error logs and Windows Event logs for issues.
+o	Validate AlwaysOn Availability Group, Replication, and Mirroring status.
+o	Check disk space availability (xp_fixeddrives).
+o	Validate SQL Server Agent and scheduled jobs.
+4.	Disable Jobs & Features
+o	Disable SQL Server Agent jobs and maintenance tasks.
+o	Stop dependent applications and services.
+o	Disable database replication, log shipping, or AlwaysOn if applicable.
+o	Ensure no active database transactions are running.
+________________________________________
+Patching Process (Execution Phase)
+1.	Apply the SQL Server Patch
+o	Run SQL Server setup and choose the correct patch.
+o	Follow on-screen instructions and monitor for errors.
+o	Validate patch installation using SELECT @@VERSION.
+2.	Monitor Upgrade Progress
+o	Track patch installation via setup logs (C:\Program Files\Microsoft SQL Server\xxxx\Setup Bootstrap\Log).
+o	Ensure no errors or warnings are encountered.
+________________________________________
+Post-Patching Checks (Validation Phase)
+1.	Verify SQL Server Services
+o	Ensure SQL Server services and SQL Server Agent are running.
+o	Check SQL Server error logs for startup errors.
+o	Validate cluster failover if in a cluster environment.
+2.	Database Health & Performance
+o	Run DBCC CHECKDB on critical databases.
+o	Execute baseline performance checks (CPU, Memory, Disk).
+o	Check replication, mirroring, log shipping, and AlwaysOn availability groups.
+3.	Validate Applications & Connectivity
+o	Test application connections to the database.
+o	Run test queries to verify query execution performance.
+o	Ensure Linked Servers, SSIS packages, and SQL Jobs are working fine.
+4.	Re-Enable Jobs & Services
+o	Enable SQL Agent jobs and verify execution.
+o	Start any dependent applications or services.
+5.	Final Backup & Documentation
+o	Take a new full backup post-patching.
+o	Document patching steps, issues, resolutions, and rollback plan if needed.
+________________________________________
+Rollback Plan (In Case of Failure)
+1.	Restore the system/database backups.
+2.	Revert to the previous SQL Server version (if needed).
+3.	Validate rollback success with application teams.
+________________________________________
+This checklist ensures a smooth and risk-free SQL Server patching process. Let me know if you need modifications based on your environment!
+
