@@ -1,0 +1,119 @@
+https://github.com/SQLUndercover/UndercoverToolbox/blob/master/sp_LockDetails.sql
+
+https://gavindraper.com/2019/02/13/SQL-Server-Backup-Stats/
+
+https://github.com/SQLUndercover/UndercoverToolbox/blob/master/sp_restorescript.sql
+
+WITH LatestBackups AS (
+    SELECT 
+        database_name, 
+        MAX(backup_finish_date) AS Last_Backup,
+        MAX(CASE WHEN type = 'D' THEN backup_finish_date END) AS Last_Full_Backup,
+        MAX(CASE WHEN type = 'I' THEN backup_finish_date END) AS Last_Diff_Backup,
+        MAX(CASE WHEN type = 'L' THEN backup_finish_date END) AS Last_Log_Backup
+    FROM msdb.dbo.backupset
+    GROUP BY database_name
+)
+SELECT 
+    a.server_name AS [Server_Name], 
+    a.database_name AS [Database_Name], 
+	d.recovery_model_desc AS [Recovery_Model],
+    lb.Last_Backup AS [Last_Backup],  
+    CASE a.type
+        WHEN 'D' THEN 'FULL'
+        WHEN 'I' THEN 'Differential'
+        WHEN 'L' THEN 'Log'
+        WHEN 'F' THEN 'FileGroup'
+        WHEN 'G' THEN 'FileGroup Differential'
+        WHEN 'P' THEN 'Partial'
+        WHEN 'Q' THEN 'Partial Differential'
+    END AS [Backup_Type],
+    a.name AS [Backup_Set],
+    DATEDIFF(DAY, lb.Last_Backup, GETDATE()) AS [Days_Since_Last_Backup],
+    lb.Last_Full_Backup AS [Last_Full_Backup],
+    lb.Last_Diff_Backup AS [Last_Diff_Backup],
+    lb.Last_Log_Backup AS [Last_Log_Backup],
+    CAST(CAST(a.backup_size / 1048576 AS INT) AS VARCHAR(14)) AS bkSizeMB,
+    CAST(CAST(a.compressed_backup_size / 1048576 AS INT) AS VARCHAR(14)) AS Compressed_bkSizeMB,
+    CAST(DATEDIFF(SECOND, a.backup_start_date, a.backup_finish_date) AS VARCHAR(12)) + ' Seconds' AS TimeTaken,
+    CASE WHEN a.is_copy_only = 1 THEN 'Yes' ELSE 'No' END AS [Is_Copy_Backup],
+    COUNT(*) OVER (PARTITION BY a.database_name) AS [Backup_Count],
+	m.physical_device_name
+FROM msdb.dbo.backupset AS a
+INNER JOIN msdb.dbo.backupmediafamily AS m ON a.media_set_id = m.media_set_id
+INNER JOIN master.sys.databases AS d ON a.database_name = d.name
+INNER JOIN LatestBackups AS lb ON a.database_name = lb.database_name
+GROUP BY a.server_name, a.database_name, a.type, a.name, m.physical_device_name, a.backup_size, a.compressed_backup_size, a.backup_start_date, a.backup_finish_date, a.is_copy_only, d.recovery_model_desc, lb.Last_Backup, lb.Last_Full_Backup, lb.Last_Diff_Backup, lb.Last_Log_Backup
+ORDER BY 4;
+
+
+======================================
+
+DECLARE @RPO_Hours INT = 24;
+
+-- Create a table to store the backup status
+IF OBJECT_ID('tempdb..#BackupStatus') IS NOT NULL
+    DROP TABLE #BackupStatus;
+
+CREATE TABLE #BackupStatus (
+    DatabaseName NVARCHAR(128),
+    LastFullBackup DATETIME,
+    LastDiffBackup DATETIME,
+    LastLogBackup DATETIME,
+    RecoveryModel NVARCHAR(20),
+    BackupSet NVARCHAR(128),
+    FullBackupSizeMB DECIMAL(18,2),
+    IsCopyOnlyBackup NVARCHAR(50),
+    HoursSinceLastBackup INT,
+    RPOExceeded BIT
+);
+
+-- Insert backup status for each database
+INSERT INTO #BackupStatus (DatabaseName, LastFullBackup, LastDiffBackup, LastLogBackup, RecoveryModel, BackupSet, FullBackupSizeMB, IsCopyOnlyBackup, HoursSinceLastBackup, RPOExceeded)
+SELECT 
+    d.name AS DatabaseName,
+    MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date ELSE NULL END) AS LastFullBackup,
+    MAX(CASE WHEN bs.type = 'I' THEN bs.backup_finish_date ELSE NULL END) AS LastDiffBackup,
+    MAX(CASE WHEN bs.type = 'L' THEN bs.backup_finish_date ELSE NULL END) AS LastLogBackup,
+    d.recovery_model_desc AS RecoveryModel,
+    MAX(bs.name) AS BackupSet,
+    MAX(CASE WHEN bs.type = 'D' THEN bs.backup_size ELSE NULL END) / 1024.0 / 1024.0 AS FullBackupSizeMB,
+    CASE 
+        WHEN MAX(CASE WHEN bs.type = 'D' THEN CAST(bs.is_copy_only AS INT) ELSE NULL END) = 1 THEN 'This is a copy-only backup'
+        ELSE 'No'
+    END AS IsCopyOnlyBackup,
+    DATEDIFF(HOUR, MAX(bs.backup_finish_date), GETDATE()) AS HoursSinceLastBackup,
+    CASE 
+        WHEN DATEDIFF(HOUR, MAX(bs.backup_finish_date), GETDATE()) > @RPO_Hours THEN 1
+        ELSE 0
+    END AS RPOExceeded
+FROM 
+    master.sys.databases d
+LEFT JOIN 
+    msdb.dbo.backupset bs ON bs.database_name = d.name
+GROUP BY 
+    d.name, 
+    d.recovery_model_desc;
+
+-- Select the backup status
+SELECT 
+    DatabaseName, 
+    RecoveryModel,
+    LastFullBackup, 
+    LastDiffBackup, 
+    LastLogBackup, 
+	IsCopyOnlyBackup,
+    BackupSet,
+    ISNULL(FullBackupSizeMB, 0) AS FullBackupSizeMB, -- Handle NULL values 
+    HoursSinceLastBackup, 
+    CASE 
+        WHEN RPOExceeded = 1 THEN 'YES'
+        ELSE 'NO'
+    END AS RPOExceeded
+FROM 
+    #BackupStatus
+ORDER BY 
+    DatabaseName;
+
+-- Drop the temporary table
+DROP TABLE #BackupStatus;
