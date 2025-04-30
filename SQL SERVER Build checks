@@ -1,0 +1,417 @@
+# -----------------------------------------------------------------------------
+# Author:      Ketan Chawda (Modified)
+# Date:        FEB 2025
+#
+# File Name:   Invoke QA Process Checks.ps1
+#
+# Purpose:     PowerShell script to automate QA  checks process for New Servers.
+#
+# History:
+# Date         Comment
+# -----------  ----------------------------------------------------------------
+# Define SQL Server instance
+
+$Kcluster = "PRDS\SQL_cluvforsqlua01"  # Change for Cluster Name
+$SQLServer = "EGLQPSVTSQL08"          # Change this to your SQL Server
+$Instance = "SQL_01"                   # Change for Named instances
+
+# Function to execute SQL Query
+Function Invoke-SqlQuery {
+    param (
+        [string]$Query
+    )
+    try {
+        Invoke-Sqlcmd -ServerInstance "$SQLServer\$Instance,1471" -Query $Query -TrustServerCertificate:$true -ErrorAction Stop
+#        Invoke-Sqlcmd -ServerInstance "aglvforsqlpr01,1471" -TrustServerCertificate:$false -Encrypt Optional -Query $Query -EncryptConnection:$false -Encrypt Optional -ErrorAction Stop
+    } catch {
+        Write-Host "Error executing SQL query: $_" -ForegroundColor Red
+    }
+}
+
+# Function to check Physical RAM and CPU Info
+Function Check-SystemInfo {
+    Write-Host "`n>>> > Checking System Information..." -ForegroundColor Green
+    Write-Host " "
+    $ram = Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object TotalPhysicalMemory
+    $cpu = Get-CimInstance -ClassName Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+    Write-Host " "
+    Write-Host "Server Name : << < $env:COMPUTERNAME > >>" -ForegroundColor Yellow
+    Write-Host "
+Total CPU Info : $($cpu.Name), 
+
+      CPU Cores: << > $($cpu.NumberOfCores) < >>, Logical Processors: << > $($cpu.NumberOfLogicalProcessors) < >>"  -ForegroundColor Yellow
+    Write-Host " "
+    Write-Host "Total Physical RAM: $([math]::round($ram.TotalPhysicalMemory / 1GB, 2)) GB" -ForegroundColor Yellow
+Write-Host " "
+}
+
+# Verify SQL / OS Server Info
+Function Check-KInfo {
+Write-Host " "
+Write-Host "`n>>> > Checking Server / OS Informations..." -ForegroundColor Green
+Invoke-SqlQuery "SELECT  RIGHT(@@version, LEN(@@version) - 3 - CHARINDEX(' ON ', @@VERSION)) AS [Operating System Information] ,
+        LEFT(@@VERSION, CHARINDEX('-', @@VERSION) - 2) + ' ' + CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(300)) AS [SQL Server Version] ,
+        @@SERVERNAME AS [SQL Server - Instance Name] ,
+        Service_Account AS [SQL Server - Service Account] ,
+        Instant_File_Initialization_Enabled AS [Instant File Initialization Enabled]
+FROM    sys.dm_server_services
+WHERE   servicename LIKE 'SQL Server (%'"
+}
+
+# Function to check SQL Services
+Function Check-SQLServices {
+    Write-Host "`n>>> > Checking SQL Server Services Running..." -ForegroundColor Green
+Get-Service *SQL*  | Select-Object Name, DisplayName, Status, StartType  | Format-Table -AutoSize
+}
+
+# Function to check Server Memory
+Function Check-Mem {
+    Write-Host "`n>>> > Checking Max / Min Server Memorys (MB)..." -ForegroundColor Green
+    Write-Host " "
+    $MemQuery = "SELECT name, value, value_in_use, [description] FROM sys.configurations WHERE name like '%server memory%' ORDER BY name OPTION (RECOMPILE);"
+    Invoke-SqlQuery $MemQuery | Format-Table -AutoSize
+}
+
+# Function to check Agents Jobs
+Function Check-AJobs {
+    Write-Host "`n>>> > Checking Agent Jobs Created..." -ForegroundColor Green
+    Write-Host " "
+    $JobQuery = "SELECT
+     name,
+     enabled,
+     database_name,
+	 description
+FROM
+    msdb.dbo.sysjobs job
+INNER JOIN 
+    msdb.dbo.sysjobsteps steps        
+ON
+    job.job_id = steps.job_id
+--WHERE database_name <> 'NULL'
+order by 1;"
+    Invoke-SqlQuery $JobQuery | Format-Table -AutoSize
+}
+
+# Function to check Server mail config
+Function Check-Main-cfg {
+    Write-Host "`n>>> > Checking SQL Server IMP Configuration..." -ForegroundColor Green
+    Write-Host " "
+    $confQuery = "SELECT
+    c.name,
+    c.value,
+    c.value_in_use,
+    c.description,
+    socket_count = 
+        CASE c.name
+             WHEN N'max degree of parallelism'
+             THEN osi.socket_count
+             ELSE NULL
+        END, 
+    cores_per_socket = 
+        CASE c.name
+             WHEN N'max degree of parallelism'
+             THEN osi.cores_per_socket
+             ELSE NULL
+        END
+FROM sys.configurations AS c
+CROSS JOIN
+(
+    SELECT 
+        osi.socket_count,
+        osi.cores_per_socket
+    FROM sys.dm_os_sys_info AS osi
+) AS osi
+WHERE c.name IN 
+(
+    N'cost threshold for parallelism',
+    N'max degree of parallelism'
+);"
+    Invoke-SqlQuery $confQuery | Format-Table -AutoSize
+
+$conf2Query = "SELECT name, value_in_use FROM sys.configurations WHERE name in ('network packet size (B)',  'optimize for ad hoc workloads')"
+    Invoke-SqlQuery $conf2Query | Format-Table -AutoSize
+}
+
+# Function to check Instant File Initialization
+Function Check-InstantFileInitialization {
+    Write-Host "`n>>> > Checking Instant File Initialization..." -ForegroundColor Green
+    Write-Host " "
+    $ifiStatus = (Get-CimInstance -ClassName Win32_AccountPrivilege | Where-Object { $_.Privilege -eq "SeManageVolumePrivilege" })
+    if ($ifiStatus) {
+        Write-Host "Instant File Initialization is enabled." -ForegroundColor Green
+    } else {
+        Write-Host "Instant File Initialization is NOT enabled." -ForegroundColor Red
+    }
+}
+
+# Function to check SQL Server Default Port
+Function Check-DefaultPort {
+    Write-Host "`n>>> > Checking SQL Server Default Port..." -ForegroundColor Green
+    Write-Host " "
+    $portQuery = "Select distinct local_net_address, local_tcp_port from sys.dm_exec_connections where local_net_address is not null"
+    $port = Invoke-SqlQuery $portQuery
+    Invoke-SqlQuery $portQuery | Format-Table -AutoSize
+}
+
+# Function to check Default Data, Log, and Backup Paths
+Function Check-DefaultPaths {
+    Write-Host "`n>>> > Checking Default Data, Log, and Backup Paths..." -ForegroundColor Green
+    Write-Host " "
+    Write-Host " "
+$DQuery = "Select SERVERPROPERTY('InstanceDefaultDataPath') as 'Data_Path'"
+    $dqry = Invoke-SqlQuery $DQuery
+    if ($dqry) {
+        Write-Host "SQL Server Default Data Path: $($dqry.Data_Path)" 
+    } else {
+        Write-Host "Failed to retrieve Default Path." -ForegroundColor Red
+    }
+$LQuery = "Select SERVERPROPERTY('InstanceDefaultLogPath') as 'Log_Path'"
+    $lqry = Invoke-SqlQuery $LQuery
+    Write-Host " "
+    if ($lqry) {
+        Write-Host "SQL Server Default LOG Path: $($lqry.Log_Path)" 
+    } else {
+        Write-Host "Failed to retrieve Default Path." -ForegroundColor Red
+    }
+$BQuery = "Select SERVERPROPERTY('InstanceDefaultBackupPath') as 'Backup_Path'"
+    $bqry = Invoke-SqlQuery $BQuery
+    Write-Host " "
+    if ($bqry) {
+        Write-Host "SQL Server Default Backup Path: $($bqry.Backup_Path)" 
+    } else {
+        Write-Host "Failed to retrieve Default Path." -ForegroundColor Red
+    }
+    Write-Host " "
+}
+
+# Function to check Collation
+Function Check-Collation {
+    Write-Host "`n>>> > Checking Database Collation..." -ForegroundColor Green
+    Write-Host " "
+    $collationQuery = "SELECT SERVERPROPERTY('Collation') AS ServerCollation"
+    $collation = Invoke-SqlQuery $collationQuery
+    if ($collation) {
+    Write-Host " "
+        Write-Host "Server Collation: $($collation.ServerCollation)" 
+    } else {
+        Write-Host "Failed to retrieve collation." -ForegroundColor Red
+    }
+    Write-Host " "
+}
+
+# Function to check Compatibility Level
+Function Check-CompatibilityLevel {
+    Write-Host "`n>>> > Checking Database / Compatibility Level..." -ForegroundColor Green
+    Write-Host " "
+    $compatibilityQuery = "SELECT name, compatibility_level FROM sys.databases"
+    Invoke-SqlQuery $compatibilityQuery | Format-Table -AutoSize
+}
+
+# Function to check Disk Drives
+Function Check-DiskDrives {
+    Write-Host "`n>>> > Checking ALL Server Disk Drives..." -ForegroundColor Green
+    Write-Host " "
+    Get-PSDrive -PSProvider FileSystem | Format-Table Name, Root, Used, Free -AutoSize
+    Write-Host "`n>>> > Checking Bytes Per Cluster for all DRIVES..." -ForegroundColor Green
+#    Write-Host " "
+Write-Host "`n>>> > Checking Drive Format for... << C: >> " -ForegroundColor Green
+    fsutil fsinfo ntfsinfo C: | findstr 'Bytes'
+    Write-Host " "
+Write-Host "`n>>> > Checking Drive Format for... << D: >> " -ForegroundColor Green
+    Write-Host " "
+    fsutil fsinfo ntfsinfo D: | findstr 'Bytes'
+    Write-Host " "
+Write-Host "`n>>> > Checking Drive Format for... << E: >> " -ForegroundColor Green
+    Write-Host " "
+    fsutil fsinfo ntfsinfo E: | findstr 'Bytes'
+    Write-Host " "
+Write-Host "`n>>> > Checking Drive Format for... << F: >> " -ForegroundColor Green
+    Write-Host " "
+    fsutil fsinfo ntfsinfo F: | findstr 'Bytes'
+    Write-Host " "
+Write-Host "`n>>> > Checking Drives Format for... << G: >> " -ForegroundColor Green
+    Write-Host " "
+    fsutil fsinfo ntfsinfo G: | findstr 'Bytes'
+    Write-Host " "
+Write-Host "`n>>> > Checking Drives Format for... << H: >> " -ForegroundColor Green
+    Write-Host " "
+    fsutil fsinfo ntfsinfo H: | findstr 'Bytes'
+}
+
+# Function to check TempDB Details
+Function Check-TempDB {
+    Write-Host "`n>>> > Checking TempDB Details..." -ForegroundColor Green
+    Write-Host " "
+    $tempDBQuery = "SELECT name, size, max_size, growth, physical_name FROM sys.master_files WHERE database_id = DB_ID('tempdb')"
+    Invoke-SqlQuery $tempDBQuery | Format-Table -AutoSize
+}
+
+
+# Verify and Register SPN for SQL Server
+Function Check-SPN {
+Write-Host " "
+Write-Host " "
+Write-Host ">>> > Checking SPN Registration for Host..." -ForegroundColor Green
+Write-Host " "
+$spnQuery = "setspn -L $env:COMPUTERNAME"
+Invoke-Expression $spnQuery
+
+Write-Host " "
+Write-Host ">>> > Checking SPN Registration for SA Account..." -ForegroundColor Green
+Write-Host " "
+$spnQuery2 = "setspn -L $Kcluster"
+Invoke-Expression $spnQuery2
+}
+
+# Verify SQL Trace Flags Enabled for SQL Server
+Function Check-Trace {
+Write-Host " "
+Write-Host ">>> > Checking SQL Trace Flags for SQL Server..." -ForegroundColor Green
+    Write-Host " "
+    Invoke-SqlQuery "DBCC TRACESTATUS" | Format-Table -AutoSize
+}
+
+# Verify SQL Trace Flags Enabled for SQL Server
+Function Check-Mail {
+Write-Host " "
+Write-Host "`n>>> > Checking Mail / SMTP / Profile for SQL Server..." -ForegroundColor Green
+    Write-Host " "
+    Invoke-SqlQuery "EXEC msdb.dbo.sysmail_help_profileaccount_sp" | Format-Table -AutoSize 
+    Write-Host " "
+    Invoke-SqlQuery "EXEC msdb.dbo.sysmail_help_account_sp" | Format-Table -AutoSize 
+    Write-Host " "
+    Invoke-SqlQuery "SELECT top 5 profile_id, recipients, send_request_user, sent_status, sent_date FROM msdb.dbo.sysmail_allitems ORDER BY mailitem_id DESC " | Format-Table -AutoSize
+}
+
+# Verify LC for SQL Server
+Function Check-Link {
+Write-Host " "
+Write-Host "`n>>> > Checking Linked Server for SQL Server..." -ForegroundColor Green
+    Write-Host " "
+    Invoke-SqlQuery "DECLARE @LinkedServerName NVARCHAR(128), @Active BIT, @Message NVARCHAR(MAX)=''
+DECLARE @Servers TABLE
+(SRV_NAME NVARCHAR(128)
+,SRV_PROVIDERNAME   NVARCHAR(128)
+,SRV_PRODUCT    NVARCHAR(128)
+,SRV_DATASOURCE NVARCHAR(4000)
+,SRV_PROVIDERSTRING NVARCHAR(4000)
+,SRV_LOCATION   NVARCHAR(4000)
+,SRV_CAT    NVARCHAR(128)
+,Active BIT DEFAULT 1)
+
+INSERT INTO @Servers (SRV_NAME,SRV_PROVIDERNAME,SRV_PRODUCT,SRV_DATASOURCE,SRV_PROVIDERSTRING,SRV_LOCATION,SRV_CAT)
+EXEC sp_linkedservers 
+ 
+DECLARE servercursor CURSOR FOR
+    SELECT SRV_NAME, Active 
+    FROM @Servers
+    ORDER BY SRV_NAME
+ 
+OPEN servercursor
+ 
+FETCH NEXT FROM servercursor INTO @LinkedServerName, @Active
+WHILE @@FETCH_STATUS=0
+BEGIN
+    DECLARE @isUp BIT = 0
+        BEGIN TRY
+        DECLARE @test INT
+        EXEC @test = sp_testlinkedserver @LinkedServerName;
+        IF @test = 0
+            BEGIN
+                SET @isUp = 1
+            END
+        ELSE
+            BEGIN
+                SET @isUp = 0
+            END
+    END TRY
+    BEGIN CATCH         
+        SET @isUp = 0;
+    END CATCH         
+    IF @Active<>@isUp
+    BEGIN
+        UPDATE @Servers 
+        SET Active=@isUp
+        WHERE SRV_NAME=@LinkedServerName
+ 
+        SET @Message = @Message + 'Active bit on server ' + @LinkedServerName + ' was set to ' + CONVERT(VARCHAR,@isUp) + '.' + CHAR(10) + CHAR(13)
+    END    
+    FETCH NEXT FROM servercursor INTO @LinkedServerName, @Active
+END
+CLOSE servercursor
+DEALLOCATE servercursor
+ 
+SELECT SRV_NAME AS [ACTIVE_LINKED SERVER]
+FROM @Servers
+WHERE Active=1
+ORDER BY SRV_NAME
+ 
+PRINT @Message " | Format-Table -AutoSize
+}
+
+# Function to check System Power Settings
+Function Check-PSQLSystem {
+    Write-Host "`n>>> > Checking System Power Settings..." -ForegroundColor Green
+Write-Host " "
+Powercfg /GetActiveScheme
+Write-Host " "
+}
+
+# Function to check SQL Server and Agent Logs for Errors
+Function Check-ErrorLogs {
+    Write-Host "`n>>> > Checking SQL Server Logs for Errors..." -ForegroundColor Green
+    Write-Host " "
+    Invoke-SqlQuery "EXEC xp_readerrorlog 0, 1, N'Error'" | Format-Table -AutoSize
+
+    Write-Host "`n>>> > Checking SQL Agent Logs for Errors..." -ForegroundColor Green
+    Write-Host " "
+    Invoke-SqlQuery "EXEC xp_readerrorlog 0, 2, N'Warning', N'Error'" | Format-Table -AutoSize
+}
+
+
+# Function to check HealthService
+Function Check-HSystem {
+    Write-Host "`n>>> > Checking Server Health Service Settings..." -ForegroundColor Green
+Write-Host " "
+Get-Service HealthService*
+Get-Service CcmExec*
+Write-Host " "
+}
+
+# Main script execution
+Clear
+Write-Host "========================================================" -ForegroundColor Green
+Write-Host "         SQL Server QA Check Process Starts now...." -ForegroundColor Yellow
+Write-Host "========================================================" -ForegroundColor Green
+
+# Execute all checks
+Check-SystemInfo
+Check-KInfo
+Check-SQLServices
+Start-Sleep -Seconds 10
+Check-Mem
+Check-Main-cfg
+Check-CompatibilityLevel
+Check-DefaultPort
+Check-Collation
+Start-Sleep -Seconds 10
+Check-DefaultPaths
+Check-TempDB
+Start-Sleep -Seconds 10
+Check-DiskDrives
+Start-Sleep -Seconds 5
+Check-SPN
+Check-Trace
+Check-Mail
+Start-Sleep -Seconds 10
+Check-AJobs
+Start-Sleep -Seconds 10
+Check-PSQLSystem
+Check-Link
+Check-ErrorLogs
+Check-HSystem
+
+
+Write-Host " "
+Write-Host "`n>>>  >> >  DBA  QA  Check Process Steps completed now  < <<  <<<" -ForegroundColor Green
+Write-Host " "
