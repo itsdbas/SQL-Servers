@@ -1,3 +1,5 @@
+### RUN on POWER SHELL as admin -  .\Morning-chk1.ps1 -serverList "EGLVQPRSQLPR02\SQL_01"
+
 # -----------------------------------------------------------------------------
 # Author:      Ketan Chawda (Modified)
 # Date:        Nov 2017
@@ -9,12 +11,15 @@
 # History:
 # Date         Comment
 # -----------  ----------------------------------------------------------------
-# 06 Nov 2017  Created
-# 27 May 2020  Changed error trapping to continue processing when a server is offline.
-# 27 May 2020  Added "is enabled" check for the failed jobs function.
-# 27 May 2020  Fixed bug in the database status funtion for mirrored databases.
-# 27 May 2020  Added a new check for Windows Cluster node status.
-# 27 May 2020  Added a new check for SQL service(s) status.
+# 06 Nov 2020  Created
+# 21 May 2021  Changed error trapping to continue processing when a server is offline.
+# 22 May 2021  Added "is enabled" check for the failed jobs function.
+# 23 May 2022  Fixed bug in the database status funtion for mirrored databases.
+# 24 May 2024  Added a new check for Windows Cluster node status.
+# 25 May 2024  Added a new check for SQL AG service(s) status.
+# 26 Mar 2025  Added a new check for SQL Replication service(s) status.
+# 27 Mar 2025  Added a new check for SQL PUB-SUB service(s) status.
+# 21 May 2025  Added a new check for Replication Transaction Summery Report.
 # -----------------------------------------------------------------------------
 #
 # Copyright (C) 2020 Microsoft Corporation
@@ -43,7 +48,7 @@ param(
   [parameter(ParameterSetName='Set2',Position=2,Mandatory=$true)][String[]]$serverList
 )
 
-####################   LOAD ASSEMBLIES   ########################
+####################   LOAD ASSEMBLIES   ################################
 
 #Attempt to load assemblies by name starting with the latest version
 try {
@@ -228,7 +233,7 @@ function Get-CmsServer {
       Returns a list of all unique (distinct) registered servers that are in the folder for this exact path "SQL2012\Cluster".
 
       .LINK
-      http://www.patrickkeisler.com/
+      http://www.pat.com/
   #>
   Param (
     [CmdletBinding()]
@@ -261,7 +266,7 @@ function Get-CmsServer {
   $serverList = @()
   $cmsFolder = $cmsGroup.Trim('\')
 
-  ############### Functions ###############
+  ############### Functions ##################
 
   Function Parse-ServerGroup {
     Param (
@@ -738,7 +743,9 @@ SELECT
         Write-Host "`nCRITICAL: $($server.TrueName) - No Server Hardware Report Available."
     }
 }#Get-SqlUptime3
+
 #############
+
 function Get-DatabaseStatus {
     Param (
         [CmdletBinding()]
@@ -755,8 +762,54 @@ function Get-DatabaseStatus {
         OR dm.mirroring_role_desc IS NULL;
 "@
 
+    $cmdg = @"
+SET NOCOUNT ON;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+
+SELECT
+    state_desc as [State], 
+	CAST(create_date as date) as Create_Date,
+	name as [DB_Name], Database_id as [DB_ID], 
+	SUSER_SNAME(owner_sid) as [Owner],
+	CASE compatibility_level
+		WHEN 65  THEN 'SQL Server 6.5'
+		WHEN 70  THEN 'SQL Server 7.0'
+		WHEN 80  THEN 'SQL Server 2000'
+		WHEN 90  THEN 'SQL Server 2005'
+		WHEN 100 THEN 'SQL Server 2008 R2'
+		WHEN 110 THEN 'SQL Server 2012'
+		WHEN 120 THEN 'SQL Server 2014'
+		WHEN 130 THEN 'SQL Server 2016'
+		WHEN 140 THEN 'SQL Server 2017'
+		WHEN 150 THEN 'SQL Server 2019'
+		WHEN 160 THEN 'SQL Server 2022'
+		ELSE CAST(compatibility_level as varchar(50))
+	END AS [Compatibility_Level],
+	user_access_desc as User_Access,
+	--is_auto_close_on as [auto_close],
+	--is_auto_shrink_on as [auto_shrink],
+	--snapshot_isolation_state_desc as snapshot_isolation,
+	--is_read_committed_snapshot_on as rsci,
+	recovery_model_desc as [Recovery_Mode],
+	--page_verify_option_desc as [Page_Verify],
+	--is_auto_create_stats_on as [auto_create_stats],
+	--is_auto_update_stats_on as [auto_update_stats],
+	--is_parameterization_forced as [parameterization_forced],
+	is_read_only as [Read_Only],
+	Is_in_standby,
+	Is_published,
+	Is_subscribed,
+	Is_merge_published,
+	--log_reuse_wait_desc as log_reuse_wait,
+	Is_encrypted
+FROM sys.databases
+WHERE database_id > 4
+ORDER BY 2
+OPTION (RECOMPILE, MAXDOP 1);
+"@
     try {
         $results = $server.ExecuteWithResults($cmd)
+$resultsg = $server.ExecuteWithResults($cmdg)
     }
     catch {
         Get-Error $_ -ContinueAfterError
@@ -777,12 +830,16 @@ function Get-DatabaseStatus {
     else {
         Write-Host "`nGOOD ($goodCount databases):" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
 Write-Host " "
-Write-Host " ALL Database are Online and Healthy !!! "
+Write-Host " ALL Databases are Online and Healthy !!! " -BackgroundColor White -ForegroundColor Red
+Write-Host " "
+    $resultsg.Tables[0] | Where-Object {$_.State -in 'ONLINE'} | Select-Object Create_Date, DB_ID,  DB_Name, State, Compatibility_Level, User_Access, Owner, Recovery_Mode, Read_Only, Is_in_standby, Is_published, Is_subscribed, Is_merge_published, Is_encrypted | Format-Table -AutoSize
 #Write-Host "`nGOOD ($goodCount databases):" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
     }
 
     # Display detailed information about databases in certain states
     $results.Tables[0] | Where-Object {$_.state_desc -in 'SUSPECT','RESTORING','RECOVERING','RECOVERY_PENDING','EMERGENCY','OFFLINE','COPYING','OFFLINE_SECONDARY'} | Select-Object database_name,state_desc | Format-Table -AutoSize
+#Write-Host " "
+#    $resultsg.Tables[0] | Where-Object {$_.state_desc -in 'ONLINE'} | Select-Object State, DB_Name, DB_ID, Owner, Compatibility_Level, User_Access, Recovery_Mode, Read_Only, Is_in_standby, Is_published, Is_subscribed, Is_merge_published, Is_encrypted, Create_Date | Format-Table -AutoSize
 }
 
 #Get-DatabaseStatus
@@ -842,7 +899,7 @@ $results.Tables[0] | Where-Object {$_.synchronization_health -in 'HEALTHY' } | S
 
    }
     else {
-      Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+      Write-Host "`nGOOD:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
 Write-Host " "
       Write-Host '*** No Availabiliy Groups detected ***'
     }
@@ -926,10 +983,83 @@ function Get-DatabaseBackupStatus {
 	    FOR type IN ([D],[I],[L])  
     ) AS PivotTable
     ORDER BY database_name;
+
+"@
+
+$cmdbakz = @"
+DECLARE @RPO_Hours INT = 24;
+
+-- Create a table to store the backup status
+IF OBJECT_ID('tempdb..#BackupStatus') IS NOT NULL
+    DROP TABLE #BackupStatus;
+
+CREATE TABLE #BackupStatus (
+    DatabaseName NVARCHAR(128),
+    LastFullBackup DATETIME,
+    LastDiffBackup DATETIME,
+    LastLogBackup DATETIME,
+    RecoveryModel NVARCHAR(20),
+    BackupSet NVARCHAR(128),
+    FullBackupSizeMB DECIMAL(18,2),
+    IsCopyOnlyBackup NVARCHAR(50),
+    HoursSinceLastBackup INT,
+    RPOExceeded BIT
+);
+
+-- Insert backup status for each database
+INSERT INTO #BackupStatus (DatabaseName, LastFullBackup, LastDiffBackup, LastLogBackup, RecoveryModel, BackupSet, FullBackupSizeMB, IsCopyOnlyBackup, HoursSinceLastBackup, RPOExceeded)
+SELECT 
+    d.name AS DatabaseName,
+    MAX(CASE WHEN bs.type = 'D' THEN bs.backup_finish_date ELSE NULL END) AS LastFullBackup,
+    MAX(CASE WHEN bs.type = 'I' THEN bs.backup_finish_date ELSE NULL END) AS LastDiffBackup,
+    MAX(CASE WHEN bs.type = 'L' THEN bs.backup_finish_date ELSE NULL END) AS LastLogBackup,
+    d.recovery_model_desc AS RecoveryModel,
+    MAX(bs.name) AS BackupSet,
+    MAX(CASE WHEN bs.type = 'D' THEN bs.backup_size ELSE NULL END) / 1024.0 / 1024.0 AS FullBackupSizeMB,
+    CASE 
+        WHEN MAX(CASE WHEN bs.type = 'D' THEN CAST(bs.is_copy_only AS INT) ELSE NULL END) = 1 THEN 'This is a copy-only backup'
+        ELSE 'No'
+    END AS IsCopyOnlyBackup,
+    DATEDIFF(HOUR, MAX(bs.backup_finish_date), GETDATE()) AS HoursSinceLastBackup,
+    CASE 
+        WHEN DATEDIFF(HOUR, MAX(bs.backup_finish_date), GETDATE()) > @RPO_Hours THEN 1
+        ELSE 0
+    END AS RPOExceeded
+FROM 
+    master.sys.databases d
+LEFT JOIN 
+    msdb.dbo.backupset bs ON bs.database_name = d.name
+GROUP BY 
+    d.name, 
+    d.recovery_model_desc;
+
+-- Select the backup status
+SELECT 
+    DatabaseName, 
+    RecoveryModel,
+    LastFullBackup, 
+    LastDiffBackup, 
+    LastLogBackup, 
+	IsCopyOnlyBackup,
+    BackupSet,
+    ISNULL(FullBackupSizeMB, 0) AS FullBackupSizeMB, -- Handle NULL values 
+    HoursSinceLastBackup, 
+    CASE 
+        WHEN RPOExceeded = 1 THEN 'YES'
+        ELSE 'NO'
+    END AS RPOExceeded
+FROM 
+    #BackupStatus
+ORDER BY  RecoveryModel, DatabaseName;
+
+-- Drop the temporary table
+DROP TABLE #BackupStatus;
+
 "@
     
     try {
         $results = $server.ExecuteWithResults($cmdbak)
+$resultszz = $server.ExecuteWithResults($cmdbakz)
     }
     catch {
         Get-Error $_ -ContinueAfterError
@@ -944,11 +1074,85 @@ function Get-DatabaseBackupStatus {
     }
     else {
         Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+##    $resultszz.Tables[0] | Where-Object {$_.DatabaseName -gt 0} | Select-Object DatabaseName, RecoveryModel, BackupSet, LastFullBackup, LastDiffBackup, LastLogBackup, IsCopyOnlyBackup, FullBackupSizeMB, HoursSinceLastBackup, RPOExceeded | Format-Table -AutoSize
+
     }
 
     $results.Tables[0] | Where-Object {$_.backup_status -in 'CRITICAL','WARNING'} | Select-Object database_name,recovery_model_desc,backup_status,status_desc | Format-Table -AutoSize
+ Write-Host "`nDatabase Backup Summary Reports:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+    $resultszz.Tables[0] | Where-Object {$_.DatabaseName -gt 0} | Select-Object DatabaseName, RecoveryModel, BackupSet, LastFullBackup, LastDiffBackup, LastLogBackup, IsCopyOnlyBackup, FullBackupSizeMB, HoursSinceLastBackup, RPOExceeded | Format-Table -AutoSize
 
 } #Get-DatabaseBackupStatus
+
+#################################
+
+# Verify DB LINKs for SQL Server
+Function Check-Link {
+    Write-Host " "
+Write-Host "`n>>> > Checking Linked Server for SQL Server..." -ForegroundColor Green
+    Write-Host " "
+    Invoke-SqlQuery "
+DECLARE @LinkedServerName NVARCHAR(128), @Active BIT, @Message NVARCHAR(MAX)=''
+DECLARE @Serversk TABLE
+(SRV_NAME NVARCHAR(128)
+,SRV_PROVIDERNAME   NVARCHAR(128)
+,SRV_PRODUCT    NVARCHAR(128)
+,SRV_DATASOURCE NVARCHAR(4000)
+,SRV_PROVIDERSTRING NVARCHAR(4000)
+,SRV_LOCATION   NVARCHAR(4000)
+,SRV_CAT    NVARCHAR(128)
+,Active BIT DEFAULT 1)
+
+INSERT INTO @Serversk (SRV_NAME,SRV_PROVIDERNAME,SRV_PRODUCT,SRV_DATASOURCE,SRV_PROVIDERSTRING,SRV_LOCATION,SRV_CAT)
+EXEC sp_linkedservers 
+ 
+DECLARE servercursor CURSOR FOR
+    SELECT SRV_NAME, Active 
+    FROM @Serversk
+    ORDER BY SRV_NAME
+ 
+OPEN servercursor
+ 
+FETCH NEXT FROM servercursor INTO @LinkedServerName, @Active
+WHILE @@FETCH_STATUS=0
+BEGIN
+    DECLARE @isUp BIT = 0
+        BEGIN TRY
+        DECLARE @test INT
+        EXEC @test = sp_testlinkedserver @LinkedServerName;
+        IF @test = 0
+            BEGIN
+                SET @isUp = 1
+            END
+        ELSE
+            BEGIN
+                SET @isUp = 0
+            END
+    END TRY
+    BEGIN CATCH         
+        SET @isUp = 0;
+    END CATCH         
+    IF @Active<>@isUp
+    BEGIN
+        UPDATE @Serversk 
+        SET Active=@isUp
+        WHERE SRV_NAME=@LinkedServerName
+ 
+        SET @Message = @Message + 'Active bit on server ' + @LinkedServerName + ' was set to ' + CONVERT(VARCHAR,@isUp) + '.' + CHAR(10) + CHAR(13)
+    END    
+    FETCH NEXT FROM servercursor INTO @LinkedServerName, @Active
+END
+CLOSE servercursor
+DEALLOCATE servercursor
+ 
+SELECT SRV_NAME AS [ACTIVE_LINKED SERVER]
+FROM @Serversk
+--WHERE Active=1
+ORDER BY SRV_NAME;
+PRINT @Message " | Format-Table -AutoSize
+}
+
+##########################################
 
 function Get-DiskSpace {
   Param (
@@ -987,7 +1191,7 @@ function Get-DiskSpace {
     }
     else { Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)" }
 
-    $results.Tables[0] | Where-Object {$_.free_space_pct -lt 20.0} | Select-Object volume_mount_point,total_size_gb,available_size_gb,free_space_pct | Format-Table -AutoSize
+    $results.Tables[0] | Where-Object {$_.free_space_pct -gt 0} | Select-Object volume_mount_point,total_size_gb,available_size_gb,free_space_pct | Format-Table -AutoSize
 } #Get-DiskSpace
 
 function Get-FailedJobs {
@@ -1107,7 +1311,8 @@ function Get-ServiceStatus {
     }
 
     # Display all services to the console
-    Write-Host "`nAll Services on $($server.TrueName):"
+    Write-Host "`nSQL SERVICES Running Status on  >  > >  $($server.TrueName)  < <  <" -BackgroundColor White -ForegroundColor Red
+Write-Host " "
     $results.Tables[0] | ForEach-Object {
         Write-Host "$($_.servicename): $($_.status_desc), Startup Type: $($_.startup_type_desc)"
     }
@@ -1171,6 +1376,7 @@ function Get-ClusterStatus {
     if ($results.Tables[0].Rows.Count -ne 0) {
         if ($results.Tables[0] | Where-Object {$_.cluster_node_status -ne 'UP'}) {
             Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName)"
+Write-Host " "
         }
         else { Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)" }
 $results.Tables[0] | Select-Object cluster_node_name, cluster_node_status | Format-Table -AutoSize
@@ -1188,7 +1394,7 @@ $results.Tables[0] | Select-Object cluster_node_name, cluster_node_status | Form
         }
     }
     if ($results.Tables[0].Rows.Count -eq 0) {
-      Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+      Write-Host "`nGOOD:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
 Write-Host " "
       Write-Host '*** No cluster detected ***'
     }
@@ -1385,6 +1591,7 @@ AND LogText NOT LIKE 'BACKUP DATABASE successfully processed %'
 AND LogText NOT LIKE 'Database differential changes were backed up. %'
 AND LogText NOT LIKE 'BACKUP DATABASE WITH DIFFERENTIAL successfully %'
 AND LogText NOT LIKE 'The activated proc %'
+AND LogText NOT LIKE 'Backup passed%'
 --change the 72 below to alter timeframe of log read.
 AND LogDate > DATEADD(hh, -24, GETDATE());  
 DROP TABLE #ErrorLog;
@@ -1412,7 +1619,350 @@ if ($executionPlans.Tables[0].Rows.Count -gt 0) {
 Write-Host "`nSQL Server ERROR Log  < 24 hours:" -BackgroundColor Red -ForegroundColor White
 #Get-Errorlog
 
-##KC
+
+##REP
+
+function Get-RepStatus {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+    $cmd = @"
+Exec sp_get_distributor;
+"@
+    #If one exists, get status of each Replication Group
+    $server = Get-SqlConnection $targetServer
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0].Rows.Count -ne 0) {
+        if ($results.Tables[0] | Where-Object {$_.installed -eq 0}) {
+            Write-Host "`nGOOD:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; 
+Write-Host " $($server.TrueName)"
+Write-Host " "
+      Write-Host '*** No PUB / SUB Replication detected ***'
+        }
+        else 
+{ Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; 
+Write-Host " $($server.TrueName)" }
+$results.Tables[0] | Select-Object  'Distribution Server', ' << <> >> ', 'Installed','Distribution DB Installed', 'Is Distribution Publisher', 'Has Remote Distribution Publisher' | Format-Table -AutoSize
+    }
+
+    #Display the results to the console - K
+    if ($results.Tables[0] | Where-Object {$_.installed -eq 1}) {
+        $results.Tables[0] | ForEach-Object {
+            if ($_.installed -eq 1) {
+                Write-Host " D I S T O  - DB  Running  =  $($_.'installed') :: << < $($_.'distribution server') > >>  " -BackgroundColor White -ForegroundColor Black
+Write-Host " "
+            }
+        }
+    }
+} #Get-RepStatus
+
+
+##REP2
+
+function Get-Rep2Status {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+    $cmd = @"
+exec sp_helpsubscriberinfo;
+"@
+    #If one exists, get status of each Replication Group
+    $server = Get-SqlConnection $targetServer
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0].Rows.Count -ne 0) {
+Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; Write-Host " $($server.TrueName)"
+$results.Tables[0] | Select-Object  'PUBlisher', ' << <> >> ', 'SUBscriber','Commit_Batch_Size', 'Status_Batch_Size','Description' | Format-Table -AutoSize
+
+#Write-Host "`nGOOD:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; 
+#Write-Host " $($server.TrueName)" 
+#Write-Host " "
+#      Write-Host '*** No PUB / SUB Replication Details Available ***'
+}
+
+} #Get-Rep2Status
+
+
+function Get-RepRun {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+    $cmd = @"
+USE distribution 
+
+SELECT 
+(CASE  
+    WHEN mdh.runstatus =  '1' THEN 'Start - '+cast(mdh.runstatus as varchar)
+    WHEN mdh.runstatus =  '2' THEN 'Succeed - '+cast(mdh.runstatus as varchar)
+    WHEN mdh.runstatus =  '3' THEN 'InProgress - '+cast(mdh.runstatus as varchar)
+    WHEN mdh.runstatus =  '4' THEN 'Idle - '+cast(mdh.runstatus as varchar)
+    WHEN mdh.runstatus =  '5' THEN 'Retry - '+cast(mdh.runstatus as varchar)
+    WHEN mdh.runstatus =  '6' THEN 'Fail - '+cast(mdh.runstatus as varchar)
+    ELSE CAST(mdh.runstatus AS VARCHAR)
+END) [Run-Status], 
+mda.subscriber_db [Subscriber-DB], 
+mda.publication [PUB-Name],
+REVERSE(SUBSTRING(REVERSE(mda.name),CHARINDEX('-',REVERSE(mda.name))+1,CHARINDEX('-',REVERSE(mda.name),CHARINDEX('-',REVERSE(mda.name))+1)-CHARINDEX('-',REVERSE(mda.name))-1)) [SUB-Name],
+CONVERT(VARCHAR(25),mdh.[time]) [Last-Synchronized],
+--und.UndelivCmdsInDistDB [UndistCom], 
+mdh.comments [Comments], 
+--'select * from distribution.dbo.msrepl_errors (nolock) where id = ' + CAST(mdh.error_id AS VARCHAR(8)) [Query More Info],
+mdh.xact_seqno [SEQ-NO],
+(CASE  
+    WHEN mda.subscription_type =  '0' THEN 'Push' 
+    WHEN mda.subscription_type =  '1' THEN 'Pull' 
+    WHEN mda.subscription_type =  '2' THEN 'Anonymous' 
+    ELSE CAST(mda.subscription_type AS VARCHAR)
+END) [SUB-Type],
+mda.publisher_db+' - '+CAST(mda.publisher_database_id as varchar) [Publisher-DB],
+mda.name [Pub - DB - Publication - SUB - AgentID]
+FROM distribution.dbo.MSdistribution_agents mda 
+LEFT JOIN distribution.dbo.MSdistribution_history mdh ON mdh.agent_id = mda.id 
+JOIN 
+    (SELECT s.agent_id, MaxAgentValue.[time], SUM(CASE WHEN xact_seqno > MaxAgentValue.maxseq THEN 1 ELSE 0 END) AS UndelivCmdsInDistDB 
+    FROM distribution.dbo.MSrepl_commands t (NOLOCK)  
+    JOIN distribution.dbo.MSsubscriptions AS s (NOLOCK) ON (t.article_id = s.article_id AND t.publisher_database_id=s.publisher_database_id ) 
+    JOIN 
+        (SELECT hist.agent_id, MAX(hist.[time]) AS [time], h.maxseq  
+        FROM distribution.dbo.MSdistribution_history hist (NOLOCK) 
+        JOIN (SELECT agent_id,ISNULL(MAX(xact_seqno),0x0) AS maxseq 
+        FROM distribution.dbo.MSdistribution_history (NOLOCK)  
+        GROUP BY agent_id) AS h  
+        ON (hist.agent_id=h.agent_id AND h.maxseq=hist.xact_seqno) 
+        GROUP BY hist.agent_id, h.maxseq 
+        ) AS MaxAgentValue 
+    ON MaxAgentValue.agent_id = s.agent_id 
+    GROUP BY s.agent_id, MaxAgentValue.[time] 
+    ) und 
+ON mda.id = und.agent_id AND und.[time] = mdh.[time] 
+where mda.subscriber_db <> 'virtual' 
+--and mdh.runstatus='6' --Fail
+--and mdh.runstatus<>'2' --Succeed
+order by mdh.[time];
+"@
+    #If one exists, get status of each Replication Group
+    $server = Get-SqlConnection $targetServer
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0].Rows.Count -gt 0) {
+        if ($results.Tables[0] | Where-Object {$_.SUBSCRIBER -ne 0}) {
+            Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; 
+Write-Host " $($server.TrueName)"
+Write-Host " "
+$results.Tables[0] | Select-Object  Run-Status, Publisher-DB, Subscriber-DB, PUB-Name, SUB-Name, Last-Synchronized, Comments | Format-Table -AutoSize
+        }
+        else 
+{ Write-Host "`nGOOD:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; 
+Write-Host " $($server.TrueName)" }
+      Write-Host '*** No RUN Status for PUB / SUB Replication detected ***'
+#$results.Tables[0] | Select-Object  Run-Status, Publisher-DB, Subscriber-DB, PUB-Name, SUB-Name, Last-Synchronized, Comments | Format-Table -AutoSize
+    }
+
+    #Display the results to the console - K
+    if ($results.Tables[0] | Where-Object {$_.SUBSCRIBER -eq 1}) {
+        $results.Tables[0] | ForEach-Object {
+            if ($_.installed -eq 1) {
+                Write-Host " Replication RUN Status  =  $($_.'Run Status') :: << < $($_.'SUB Type') > >>  " -BackgroundColor White -ForegroundColor Black
+Write-Host " "
+            }
+        }
+    }
+} #Get-RepRun
+
+### Transactional Replication Summary
+
+function Get-RepSum {
+  Param (
+    [CmdletBinding()]
+    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+    $cmd = @"
+USE [distribution]
+
+IF OBJECT_ID('Tempdb.dbo.#ReplStatssum') IS NOT NULL  
+    DROP TABLE #ReplStatssum 
+
+CREATE TABLE [dbo].[#ReplStatssum](
+    [DistributionAgentName] [nvarchar](100) NOT NULL,
+    [DistributionAgentStartTime] [datetime] NOT NULL,
+    [DistributionAgentRunningDurationInSeconds] [int] NOT NULL,
+    [IsAgentRunning] [bit] NULL,
+    [ReplicationStatus] [varchar](14) NULL,
+    [LastSynchronized] [datetime] NOT NULL,
+    [Comments] [nvarchar](max) NOT NULL,
+    [Publisher] [sysname] NOT NULL,
+    [PublicationName] [sysname] NOT NULL,
+    [PublisherDB] [sysname] NOT NULL,
+    [Subscriber] [nvarchar](128) NULL,
+    [SubscriberDB] [sysname] NULL,
+    [SubscriptionType] [varchar](64) NULL,
+    [DistributionDB] [sysname] NULL,
+    [Article] [sysname] NOT NULL,
+    [UndelivCmdsInDistDB] [int] NULL,
+    [DelivCmdsInDistDB] [int] NULL,
+    [CurrentSessionDeliveryRate] [float] NOT NULL,
+    [CurrentSessionDeliveryLatency] [int] NOT NULL,
+    [TotalTransactionsDeliveredInCurrentSession] [int] NOT NULL,
+    [TotalCommandsDeliveredInCurrentSession] [int] NOT NULL,
+    [AverageCommandsDeliveredInCurrentSession] [int] NOT NULL,
+    [DeliveryRate] [float] NOT NULL,
+    [DeliveryLatency] [int] NOT NULL,
+    [TotalCommandsDeliveredSinceSubscriptionSetup] [int] NOT NULL,
+    [SequenceNumber] [varbinary](16) NULL,
+    [LastDistributerSync] [datetime] NULL,
+    [Retention] [int] NULL,
+    [WorstLatency] [int] NULL,
+    [BestLatency] [int] NULL,
+    [AverageLatency] [int] NULL,
+    [CurrentLatency] [int] NULL
+) ON [PRIMARY]
+
+INSERT INTO #ReplStatssum 
+SELECT da.[name] AS [DistributionAgentName]
+      ,dh.[start_time] AS [DistributionAgentStartTime]
+      ,dh.[duration] AS [DistributionAgentRunningDurationInSeconds]
+      ,md.[isagentrunningnow] AS [IsAgentRunning]
+      ,CASE md.[status]
+        WHEN 1 THEN '1 - Started'
+        WHEN 2 THEN '2 - Succeeded'
+        WHEN 3 THEN '3 - InProgress'
+        WHEN 4 THEN '4 - Idle'
+        WHEN 5 THEN '5 - Retrying'
+        WHEN 6 THEN '6 - Failed'
+       END AS [ReplicationStatus]
+      ,dh.[time] AS [LastSynchronized]
+      ,dh.[comments] AS [Comments]
+      ,md.[publisher] AS [Publisher]
+      ,da.[publication] AS [PublicationName]
+      ,da.[publisher_db] AS [PublisherDB]
+      ,CASE 
+         WHEN da.[anonymous_subid] IS NOT NULL 
+            THEN UPPER(da.[subscriber_name])
+       ELSE UPPER (s.[name]) END AS [Subscriber]
+      ,da.[subscriber_db] AS [SubscriberDB]
+      ,CASE da.[subscription_type]
+        WHEN '0' THEN 'Push'  
+        WHEN '1' THEN 'Pull'  
+        WHEN '2' THEN 'Anonymous'  
+       ELSE CAST(da.[subscription_type] AS [varchar](64)) END AS [SubscriptionType]
+      ,md.[distdb] AS [DistributionDB]
+      ,ma.[article]    AS [Article]
+      ,ds.[UndelivCmdsInDistDB] 
+      ,ds.[DelivCmdsInDistDB]
+      ,dh.[current_delivery_rate] AS [CurrentSessionDeliveryRate]
+      ,dh.[current_delivery_latency] AS [CurrentSessionDeliveryLatency]
+      ,dh.[delivered_transactions] AS [TotalTransactionsDeliveredInCurrentSession]
+      ,dh.[delivered_commands] AS [TotalCommandsDeliveredInCurrentSession]
+      ,dh.[average_commands] AS [AverageCommandsDeliveredInCurrentSession]
+      ,dh.[delivery_rate] AS [DeliveryRate]
+      ,dh.[delivery_latency] AS [DeliveryLatency]
+      ,dh.[total_delivered_commands] AS [TotalCommandsDeliveredSinceSubscriptionSetup]
+      ,dh.[xact_seqno] AS [SequenceNumber]
+      ,md.[last_distsync] AS [LastDistributerSync]
+      ,md.[retention] AS [Retention]
+      ,md.[worst_latency] AS [WorstLatency]
+      ,md.[best_latency] AS [BestLatency]
+      ,md.[avg_latency] AS [AverageLatency]
+      ,md.[cur_latency] AS [CurrentLatency]
+FROM [distribution]..[MSdistribution_status] ds 
+INNER JOIN [distribution]..[MSdistribution_agents] da
+    ON da.[id] = ds.[agent_id]                          
+INNER JOIN [distribution]..[MSArticles] ma 
+    ON ma.publisher_id = da.publisher_id 
+        AND ma.[article_id] = ds.[article_id]
+INNER JOIN [distribution]..[MSreplication_monitordata] md
+    ON [md].[job_id] = da.[job_id]
+INNER JOIN [distribution]..[MSdistribution_history] dh
+    ON [dh].[agent_id] = md.[agent_id] 
+        AND md.[agent_type] = 3
+INNER JOIN [master].[sys].[servers]  s
+    ON s.[server_id] = da.[subscriber_id] 
+--Created WHEN your publication has the immediate_sync property set to true. This property dictates 
+--whether snapshot is available all the time for new subscriptions to be initialized. 
+--This affects the cleanup behavior of transactional replication. If this property is set to true, 
+--the transactions will be retained for max retention period instead of it getting cleaned up
+--as soon as all the subscriptions got the change. 
+WHERE da.[subscriber_db] <> 'virtual' 
+    AND da.[anonymous_subid] IS NULL
+    AND dh.[start_time] = (SELECT TOP 1 start_time
+                            FROM [distribution]..[MSdistribution_history] a
+                            JOIN [distribution]..[MSdistribution_agents] b
+                            ON a.[agent_id] = b.[id] AND b.[subscriber_db] <> 'virtual'
+                            WHERE [runstatus] <> 1
+                            ORDER BY [start_time] DESC)
+    AND dh.[runstatus] <> 1
+
+--SELECT 'Transactional Replication Summary Details' AS [Comments];
+SELECT [Publisher]
+      ,[PublicationName]
+      ,[PublisherDB]
+      ,[Article]
+      ,[Subscriber]
+      ,[SubscriberDB]
+      ,[SubscriptionType]
+      ,[DistributionDB]
+      ,SUM([UndelivCmdsInDistDB]) AS [UndelivCmdsInDistDB]
+      ,SUM([DelivCmdsInDistDB]) AS [DelivCmdsInDistDB]
+FROM #ReplStatssum
+GROUP BY [Publisher]
+        ,[PublicationName]
+        ,[PublisherDB]
+        ,[Article]
+        ,[Subscriber]
+        ,[SubscriberDB]
+        ,[SubscriptionType]
+        ,[DistributionDB]
+	
+"@
+    #If one exists, get status of each Replication Group
+    $server = Get-SqlConnection $targetServer
+    try {
+        $results = $server.ExecuteWithResults($cmd)
+    }
+    catch {
+        Get-Error $_ -ContinueAfterError
+    }
+
+    #Display the results to the console
+    if ($results.Tables[0].Rows.Count -gt 0) {
+        if ($results.Tables[0] | Where-Object {$_.Publisher -gt 0}) {
+            Write-Host "`nGOOD:" -BackgroundColor Green -ForegroundColor Black -NoNewline; 
+Write-Host " $($server.TrueName)"
+Write-Host " "
+$results.Tables[0] | Select-Object  Publisher, PublicationName, PublisherDB, Article, Subscriber, SubscriberDB, SubscriptionType, DistributionDB, UndelivCmdsInDistDB, DelivCmdsInDistDB | Format-Table -AutoSize
+    }
+        else 
+{ Write-Host "`nGOOD:" -BackgroundColor Yellow -ForegroundColor Black -NoNewline; 
+Write-Host " $($server.TrueName)" }
+       Write-Host '*** No Transactional Replication Summary Details ***'
+#$results.Tables[0] | Select-Object  Publisher, PublicationName, PublisherDB, Article, Subscriber, SubscriberDB, SubscriptionType, DistributionDB, UndelivCmdsInDistDB, DelivCmdsInDistDB | Format-Table -AutoSize
+    }
+
+} #Get-RepSum
+
+##AUDIT Check
 
 function Get-SqlAudit {
   Param (
@@ -1424,7 +1974,6 @@ function Get-SqlAudit {
     $cmd = @"
 
     /* Check SQL Logins for basic security measures */
-
 	IF OBJECT_ID('tempdb..#AuditResults') IS NOT NULL
 	BEGIN
 		DROP TABLE #AuditResults
@@ -1443,7 +1992,6 @@ CREATE TABLE #AuditResults
 WITH SQLLoginChecks 
 AS
 (
-
 	SELECT	CAST(SERVERPROPERTY('machinename')as sysname) AS 'ServerName'
 		,	CAST(ISNULL(SERVERPROPERTY('instancename'), SERVERPROPERTY('machinename'))as sysname) AS 'InstanceName'
 		,	name AS LoginName
@@ -1457,7 +2005,6 @@ AS
 			OR
 			is_expiration_checked = 0
 )
-
 	INSERT INTO #AuditResults
 	SELECT  CAST(ServerName as sysname) AS ServerName
 		,	CAST(InstanceName as sysname) AS InstanceName
@@ -1490,7 +2037,6 @@ AS
 				
 	FROM SQLLoginChecks
 	ORDER BY Importance DESC;
-
 /*
 --check for sysadmins
 https://msdn.microsoft.com/en-us/library/ms188772.aspx
@@ -1565,7 +2111,6 @@ Check for default service account
 	check config
 	https://docs.microsoft.com/en-us/sql/relational-databases/system-catalog-views/sys-configurations-transact-sql?view=sql-server-2017
 */
-
 	IF OBJECT_ID('tempdb..#ConfigValues') IS NOT NULL
 	BEGIN
 		DROP TABLE #ConfigValues
@@ -1574,7 +2119,6 @@ Check for default service account
 	BEGIN
 		DROP TABLE #PreferedConfig
 	END
-
 
 	Create TABLE #PreferedConfig (Name nvarchar(35),
 									Prefered bit,
@@ -1594,7 +2138,6 @@ Check for default service account
 		,	(N'xp_cmdshell', 0, 200)	
 		,	(N'default trace enabled', 1, 200)	
 		,	(N'contained database authentication', 1, 200)	
-
 
 	Create Table #ConfigValues (
 								name nvarchar(35), 
@@ -1662,7 +2205,6 @@ Check for default service account
 	FROM #LogingLevelAudit
 
 --Return the results
-
 	SELECT *
 	FROM #AuditResults
 	ORDER BY Importance DESC;
@@ -1704,7 +2246,6 @@ Checks:
 11. Buildin Administrator - Disables Buildin\Administrator group from sql login. 
 12. Database level Access - Limit the db_owner users.                         
 */
-
 
 IF OBJECT_ID('tempdb.dbo.#Result', 'U') IS NOT NULL
   DROP TABLE #result
@@ -2058,11 +2599,14 @@ use [?]
 SELECT ''?'' AS DB_Name,
 case prin.name when ''dbo'' then prin.name + '' (''+ (select SUSER_SNAME(owner_sid) from master.sys.databases where name =''?'') + '')'' else prin.name end AS UserName,
 prin.type_desc AS LoginType,
-isnull(USER_NAME(mem.role_principal_id),'''') AS AssociatedRole ,create_date,modify_date
-FROM sys.database_principals prin
+isnull(USER_NAME(mem.role_principal_id),'''') AS AssociatedRole,
+create_date,
+modify_date
+from sys.database_principals prin
 LEFT OUTER JOIN sys.database_role_members mem ON prin.principal_id=mem.member_principal_id
-WHERE prin.sid IS NOT NULL and prin.sid NOT IN (0x00) and
-prin.is_fixed_role <> 1 AND prin.name NOT LIKE ''##%'''
+WHERE prin.sid IS NOT NULL and prin.sid NOT IN (0x00) 
+AND prin.is_fixed_role != 1 
+AND prin.name NOT LIKE ''##%''';
 
 SELECT
   DBname,
@@ -2077,14 +2621,10 @@ SELECT
   AND user1.UserName = user2.UserName
   FOR xml PATH ('')), 1, 1, '') AS PermissionUser
 FROM @DB_USers user1
-GROUP BY dbname,
-         username,
-         logintype,
-         create_date,
-         modify_date
-ORDER BY DBName, username
+GROUP BY dbname, username, logintype, create_date, modify_date
+ORDER BY DBName, username;
 "@
-  
+
     #If one exists, get Security Audit reports
     try {
         $results = $server.ExecuteWithResults($cmd1)
@@ -2299,62 +2839,78 @@ Write-Host " "
 
 ### #### ####
 
+
 function Get-SqlChkEof {
-  Param (
-    [CmdletBinding()]
-    [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
-    )
+    [CmdletBinding()]
+    param (
+        [Parameter(Position = 0, Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$targetServer
+    )
 
-    $server = Get-SqlConnection $targetServer
+    try {
+        # Establish SQL Server connection
+        $server = Get-SqlConnection $targetServer
 
-    #Get-SqlChkMelt
-
-$cmdchkk = "
+        # Query 1: EOL Check
+        $eolCheckQuery = @"
 SELECT
-N'SQL Server version ' + v.SQLVersion + N' mainstream support ends on '
-+ v.EoMainstream + N', and extended support ends on ' + v.EoExtended
-+ N'. 
-
-Please consider upgrading to the latest SQL version to enjoy bug fixes !!!,
-
-Database performance improvements, and security updates for as long as possible. !!!'
-, v.EoMainstream
+    N'SQL Server version ' + v.SQLVersion + N' mainstream support ended on '
+    + v.EoMainstream + N', and extended support ends on ' + v.EoExtended
+    + N'. Please consider upgrading to the latest SQL version to enjoy bug fixes, performance improvements, and security updates.'
+    AS EOL_Message,
+    v.EoMainstream,
+    v.EoExtended
 FROM (VALUES
- ('2000',  8, '4/8/2008'	, '4/9/2013')
-,('2005',  9, '4/12/2011'	, '4/12/2016')
-,('2008', 10, '7/8/2014'	, '7/9/2019')
-,('2012', 11, '7/11/2017'	, '7/12/2022')
-,('2014', 12, '7/9/2019'	, '7/9/2024')
-,('2016', 13, '7/13/2021'	, '7/14/2026')
-,('2017', 14, '10/11/2022'	, '10/12/2027')
-,('2019', 15, '1/7/2025'	, '1/8/2030')
-,('2022', 16, '1/11/2028'	, '1/11/2033')
+ ('2000',  8, '4/8/2008', '4/9/2013'),
+ ('2005',  9, '4/12/2011', '4/12/2016'),
+ ('2008', 10, '7/8/2014', '7/9/2019'),
+ ('2012', 11, '7/11/2017', '7/12/2022'),
+ ('2014', 12, '7/9/2019', '7/9/2024'),
+ ('2016', 13, '7/13/2021', '7/14/2026'),
+ ('2017', 14, '10/11/2022', '10/12/2027'),
+ ('2019', 15, '1/7/2025', '1/8/2030'),
+ ('2022', 16, '1/11/2028', '1/11/2033')
 ) AS v(SQLVersion, MajorVersion, EoMainstream, EoExtended)
-WHERE 1=1
-AND CONVERT(DATETIME, v.EoMainstream, 101) < GETDATE()
-AND v.MajorVersion = CAST(SERVERPROPERTY('ProductMajorVersion') AS INT)
-AND CAST(SERVERPROPERTY('Edition') AS varchar(100)) <> 'SQL Azure'
+WHERE v.MajorVersion = CAST(SERVERPROPERTY('ProductMajorVersion') AS INT)
+  AND CAST(SERVERPROPERTY('Edition') AS VARCHAR(100)) <> 'SQL Azure'
 OPTION(RECOMPILE);
-"
+"@
 
-    try {
-$sqlchkk = $server.ExecuteScalar($cmdchkk)
+        # Query 2: Patch/Version Info
+        $patchInfoQuery = @"
+SELECT 
+    SERVERPROPERTY('ProductVersion') AS ProductVersion,
+    SERVERPROPERTY('ProductLevel') AS ProductLevel,
+    SERVERPROPERTY('Edition') AS Edition,
+    SERVERPROPERTY('EngineEdition') AS EngineEdition,
+    SERVERPROPERTY('ProductUpdateLevel') AS ProductUpdateLevel,
+    SERVERPROPERTY('ProductBuildType') AS ProductBuildType
+"@
 
-    }
-    catch {
-        Get-Error $_ -ContinueAfterError
-    }
+        # Execute queries
+        $eolResult = $server.ExecuteWithResults($eolCheckQuery)
+        $patchResult = $server.ExecuteWithResults($patchInfoQuery)
 
+        # Display EOL message
+        if ($eolResult.Tables[0].Rows.Count -gt 0) {
+            $eolMessage = $eolResult.Tables[0].Rows[0]["EOL_Message"]
+            Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline
+            Write-Host " $($server.TrueName) - SQL Server EOL Check"
+            Write-Host "`n$eolMessage`n"
+        }
 
-    #Display the results to the console
-    
-        Write-Host "`nCRITICAL:" -BackgroundColor Red -ForegroundColor White -NoNewline; Write-Host " $($server.TrueName) - Database EOL Check"
-Write-Host " "
-Write-Host "# SQL Server Database EOL Check # " " !!! $($sqlchkk) !!! " 
-#Write-Host "# SQL Server Database EOL Check  :: " -BackgroundColor Red -ForegroundColor Yellow -NoNewline;  Write-Host " $($sqlchkk) " -BackgroundColor Red -ForegroundColor White -NoNewline;
-Write-Host " "
+        # Display patch/version info
+        if ($patchResult.Tables[0].Rows.Count -gt 0) {
+            Write-Host "`nSQL Server Patch and Version Information:" -BackgroundColor DarkCyan -ForegroundColor White
+            $patchResult.Tables[0] | Format-Table -AutoSize
+        }
+    }
+    catch {
+        Write-Error "Error retrieving SQL Server EOL or patch information: $_"
+    }
+}
 
-} #Get-SqlChkEof
 
 #########################################
 
@@ -2637,6 +3193,75 @@ select @DatabaseMail
 
 # Example usage:
 # Get-Smtpk
+
+#########################################
+function Get-QSChk {
+    Param (
+        [CmdletBinding()]
+        [parameter(Position=0,Mandatory=$true)][ValidateNotNullOrEmpty()]$targetServer
+    )
+
+    # Get status of each database
+    $server = Get-SqlConnection $targetServer
+
+    $QSCLoginSACmd = @"
+declare @qs nvarchar(max) = 
+N'select {db1} as database_name,actual_state_desc,desired_state_desc,
+case readonly_reason
+when 0 then ''''
+when 1 then ''Database is in read-only mode''
+when 2 then ''Database is in single-user mode''
+when 4 then ''Database is in emergency mode''
+when 8 then ''Database is a secondary replica (Always On and Azure SQL Database geo-replication)''
+when 65536 then ''Reached limit set by MAX_STORAGE_SIZE_MB''
+when 131072 then ''The number of different statements has reached memory limit. In this case you should consider remove queries from the Query Store or upgrading service tier. Applies to Azure SQL Database''
+when 262144 then ''In-memory size limit has been hit. Items will be persisted to disk until space is freed up in memory. Query Store will be temporarily in read-only mode. Applies to Azure SQL Database''
+when 524288 then ''Database has reached disk size limit so Query Store can no longer grow. Applies to Azure SQL Database''
+else ''Unknown''
+end as readonly_reason_desc,
+    query_capture_mode_desc as query_capture_mode,
+    current_storage_size_mb,
+    max_storage_size_mb
+from {db2}.sys.database_query_store_options union ';
+declare @stm nvarchar(max) =''; 
+select @stm += REPLACE(REPLACE(@qs,'{db1}',QUOTENAME(name,'''')),'{db2}',QUOTENAME(name))
+from sys.databases
+where is_query_store_on = 1
+order by name;
+set @stm = left (@stm,len(@stm)-6);
+print @stm
+exec (@stm);
+"@
+
+###########################
+
+    try {
+        $lsaQueries = $server.ExecuteWithResults($QSCLoginSACmd)
+#        $ladmQueries = $server.ExecuteWithResults($QSTLoginAdminCmd)
+#        $lownQueries = $server.ExecuteWithResults($QSPLoginOwnerCmd)
+#        $lfalQueries = $server.ExecuteWithResults($LoginFailedCmd)
+    }
+    catch {
+        Write-Error "Error executing SQL query: $_"
+        return
+    }
+
+    # Display the results to the console
+
+#####################
+
+if ($lsaQueries.Tables[0].Rows.Count -gt 0) {
+
+Write-Host "`nQuery Store Enable in Database Count >>> ($($lsaQueries.Tables[0].Rows.Count)) <<< " -BackgroundColor Green -ForegroundColor Black
+Write-Host " "
+        Write-Host "`nQuery Store Database Configuration Details !!!  ($($lsaQueries.Tables[0].Rows.Count)):" -BackgroundColor Red -ForegroundColor Yellow
+Write-Host " "        
+$lsaQueries.Tables[0] | Format-Table -AutoSize -Property database_name, actual_state_desc, desired_state_desc, readonly_reason_desc, query_capture_mode, current_storage_size_mb, max_storage_size_mb
+}
+
+}
+
+###Get-QSChk
 #########################################
 
 function K-EBSVolumes {
@@ -2676,6 +3301,104 @@ $outputResults | Format-Table -AutoSize
 
 $results.Tables[0] = $outputResults 
 }
+
+######################################################
+
+function Get-DBLinks {
+    [CmdletBinding()]
+    param (
+        [Parameter(Position = 0, Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$targetServer
+    )
+
+    try {
+        # Establish SQL Server connection
+        $server = Get-SqlConnection $targetServer
+
+        # Query 1: Basic linked server info
+        $linkedServerQuery = @"
+SELECT name, provider, data_source, is_linked
+FROM sys.servers
+WHERE product = 'SQL Server' AND server_id > 0;
+"@
+
+        # Query 2: Check active status of linked servers
+        $linkedServerStatusQuery = @"
+DECLARE @LinkedServerName NVARCHAR(128), @Active BIT, @Message NVARCHAR(MAX) = ''
+DECLARE @Servers TABLE (
+    SRV_NAME NVARCHAR(128),
+    SRV_PROVIDERNAME NVARCHAR(128),
+    SRV_PRODUCT NVARCHAR(128),
+    SRV_DATASOURCE NVARCHAR(4000),
+    SRV_PROVIDERSTRING NVARCHAR(4000),
+    SRV_LOCATION NVARCHAR(4000),
+    SRV_CAT NVARCHAR(128),
+    Active BIT DEFAULT 1
+)
+
+INSERT INTO @Servers (SRV_NAME, SRV_PROVIDERNAME, SRV_PRODUCT, SRV_DATASOURCE, SRV_PROVIDERSTRING, SRV_LOCATION, SRV_CAT)
+EXEC sp_linkedservers
+
+DECLARE server_cursor CURSOR FOR
+    SELECT SRV_NAME, Active FROM @Servers ORDER BY SRV_NAME
+
+OPEN server_cursor
+FETCH NEXT FROM server_cursor INTO @LinkedServerName, @Active
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    DECLARE @isUp BIT = 0
+    BEGIN TRY
+        DECLARE @test INT
+        EXEC @test = sp_testlinkedserver @LinkedServerName
+        SET @isUp = CASE WHEN @test = 0 THEN 1 ELSE 0 END
+    END TRY
+    BEGIN CATCH
+        SET @isUp = 0
+    END CATCH
+
+    IF @Active <> @isUp
+    BEGIN
+        UPDATE @Servers SET Active = @isUp WHERE SRV_NAME = @LinkedServerName
+        SET @Message += 'Active bit on server ' + @LinkedServerName + ' was set to ' + CONVERT(VARCHAR, @isUp) + CHAR(13) + CHAR(10)
+    END
+
+    FETCH NEXT FROM server_cursor INTO @LinkedServerName, @Active
+END
+CLOSE server_cursor
+DEALLOCATE server_cursor
+
+SELECT SRV_NAME AS [ACTIVE_LINKED_SERVER] FROM @Servers ORDER BY SRV_NAME;
+"@
+
+        # Execute queries
+        $linkedServers = $server.ExecuteWithResults($linkedServerQuery)
+        $linkedServerStatus = $server.ExecuteWithResults($linkedServerStatusQuery)
+
+        # Output results
+        if ($linkedServers.Tables[0].Rows.Count -gt 0) {
+            Write-Host "`nDatabase Linked Server Details ($($linkedServers.Tables[0].Rows.Count)):" -BackgroundColor DarkBlue -ForegroundColor White
+Write-Host " "
+            $linkedServers.Tables[0] | Format-Table -AutoSize -Property name, provider, data_source, is_linked
+        }
+
+        if ($linkedServerStatus.Tables[0].Rows.Count -gt 0) {
+            Write-Host "`nDatabase Active Linked Server Status ($($linkedServerStatus.Tables[0].Rows.Count)):" -BackgroundColor DarkGreen -ForegroundColor White
+Write-Host " "
+            $linkedServerStatus.Tables[0] | Format-Table -AutoSize
+        }
+    }
+    catch {
+        Write-Error "Error retrieving linked server information: $_"
+    }
+}
+
+# Get-DBLinks
+
+######################################################
+
+
 ####################   MAIN   ########################
 Clear-Host
 
@@ -2693,21 +3416,21 @@ else {
 
 #Check SQL Server
 Write-Host " "
-Write-Host "                 < < < < < < <  <  <  < # >  >  >  > > > > > >                " -BackgroundColor Black -ForegroundColor Red
-#Write-Host "###  Ketan's Daily Check - SQL Server Report (DD.HH:MM:SS):  ###" -BackgroundColor Red -ForegroundColor Yellow
-Write-Host "# > >  Ketan's Daily Check - SQL Server Report ($((Get-Date).ToString('dd-MMM-yyyy')) - $((Get-Date).ToString('HH:mm:ss')))  < < #" -BackgroundColor Red -ForegroundColor Yellow
-Write-Host "                 < < < < < < <  <  <  < # >  >  >  > > > > > >                " -BackgroundColor Black -ForegroundColor Green
+Write-Host "          <  <  <  <  <  <  <  <  <  <  <   <   <   <  # * #  >   >   >   >  >  >  >  >  >  >  >  >  >          " -BackgroundColor Black -ForegroundColor Cyan
+Write-Host "          # > >  DBA's - SQL Server Database Daily Check Report  < <  #  >  > ($((Get-Date).ToString('dd-MMM-yyyy')) - $((Get-Date).ToString('HH:mm:ss')))          " -BackgroundColor Red -ForegroundColor Yellow
+Write-Host "          <  <  <  <  <  <  <  <  <  <  <   <   <   <  # * #  >   >   >   >  >  >  >  >  >  >  >  >  >          " -BackgroundColor Black -ForegroundColor Magenta
 
 Write-Host " "
-Write-Host " G O O D  M.O.R.N.I.N.G .. .. . Ketan Chawda !!!"
+Write-Host " G.O.O.D.  M.O.R.N.I.N.G ... .. . Database Team !!!"
 Write-Host " "
 Write-Host " "
+Start-Sleep -s 10
 #Check uptime of each SQL Server
-Write-Host "##########  SQL Server Uptime Report ($((Get-Date).ToString('dd-MMM-yyyy'))):  ###########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "##########  SQL Server Uptime Report ($((Get-Date).ToString('dd-MMM-yyyy'))):  ##########################" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-SqlUptime -targetServer $targetServer}
 Write-Host " "
-Write-Host "##########  Server Hardware Informations Report ($((Get-Date).ToString('dd-MMM-yyyy'))):  ###########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "##########  Server Hardware Informations Report ($((Get-Date).ToString('dd-MMM-yyyy'))):  ###############" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-SqlUptime2 -targetServer $targetServer}
 Write-Host " "
@@ -2715,58 +3438,88 @@ Write-Host "##########  SQL Server Memory Recommendations Report ($((Get-Date).T
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-SqlUptime3 -targetServer $targetServer}
 #Get the status of each SQL service
-Write-Host "`n##########  SQL Server Service(s) Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  SQL Server Service(s) Status Report:  ############" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-ServiceStatus -targetServer $targetServer }
 
 Start-Sleep -s 10
 
-#Get the state of each Windows cluster node
-Write-Host "`n##########  Windows Cluster Node Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
-Write-Host " "
-ForEach ($targetServer in $targetServerList) { Get-ClusterStatus -targetServer $targetServer }
-
-#Get status of each Availability Group for each server
-Write-Host "`n##########  Availability Groups Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
-Write-Host " "
-ForEach ($targetServer in $targetServerList) { Get-AGStatus -targetServer $targetServer}
-
 #Get status of each database for each server
-Write-Host "`n##########  Database Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  Database Status Report:  #########################" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-DatabaseStatus -targetServer $targetServer}
 Write-Host " "
 
 Start-Sleep -s 10
 
-#Get the most recent backup of each database
-Write-Host "`n##########  Database Backup Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+#Get the state of each Windows cluster node
+Write-Host "`n##############  Windows Cluster Node Status Report:  #############" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
-ForEach ($targetServer in $targetServerList) { Get-DatabaseBackupStatus -targetServer $targetServer}
+ForEach ($targetServer in $targetServerList) { Get-ClusterStatus -targetServer $targetServer }
+
+#Get status of each Availability Group for each server
+Write-Host "`n##############  Availability Groups Status Report:  ##############" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-AGStatus -targetServer $targetServer}
+
+#Get the state of each Replication Nodes
+Write-Host "`n##############  Replications Check Status Report:  ###############" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-RepStatus -targetServer $targetServer }
+
+#Get the state of each Replication Nodes
+Write-Host "`n############## Replications PUB - SUB Status Report:  ############" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-Rep2Status -targetServer $targetServer }
+
+#Get the state of each Replication Nodes
+Write-Host "`n############## Replications Run Status Report:  ##################" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-RepRun -targetServer $targetServer }
+
+#Get the state of each Replication Nodes
+Write-Host "`n############## Replication Transactional Summary Details #########" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-RepSum -targetServer $targetServer }
 
 Start-Sleep -s 10
 
+#Get the most recent backup of each database
+Write-Host "`n##############  Database Backup Status Report:  ##################" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-DatabaseBackupStatus -targetServer $targetServer}
+
+#Get the most recent backup of each database
+Write-Host "`n##############  Database Active DB LINKS Status:  ##################" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-DBLinks -targetServer $targetServer}
+
+########################################
+Start-Sleep -s 15
+########################################
+
+
 #Get the disk space info for each server
-Write-Host "`n##########  Disk Space Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  Disk Space Status Report:  #######################" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-DiskSpace -targetServer $targetServer}
 
 #Get the failed jobs for each server
-Write-Host "`n##########  Failed Jobs Status Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  Failed Agent Jobs Status Report:  ################" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-FailedJobs -targetServer $targetServer}
 
 ##KC
 
 #Get the failed jobs for each server
-Write-Host "`n##########  Long Running SQL Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  Long Running Query SQL Report:  ##################" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-LongRunSQL -targetServer $targetServer}
 
 Start-Sleep -s 10
 
 #Get the failed jobs for each server
-Write-Host "`n##########  SQL Server Error Log Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  SQL Server Error Log Report:  ####################" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-Errorlog -targetServer $targetServer}
 
@@ -2785,30 +3538,37 @@ Start-Sleep -s 10
 #ForEach ($targetServer in $targetServerList) { Get-EBSVolumes -targetServer $targetServer}
 
 ###Get-SqlChkMelt
-Write-Host "`n##########  SQL Server Spectre / Meltdown Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  SQL Server Spectre/Meltdown Check Report:  #######" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-SqlChkMelt -targetServer $targetServer}
 Write-Host " "
 
 ###Get-Smtpk
-Write-Host "`n##########  SQL Server SMTP  Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  SQL Server SMTP  Check Report:  ##################" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-Smtpk -targetServer $targetServer}
 Write-Host " "
 
 ###Get-SqlChkEof
-Write-Host "`n##########  SQL Server Database EOL Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
+Write-Host "`n##############  SQL Server Database EOL Check Report:  ###########" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
 ForEach ($targetServer in $targetServerList) { Get-SqlChkEof -targetServer $targetServer}
 Write-Host " "
 
+###Get-QSChk
+Write-Host "`n##############  SQL Server Query Store Checks ...  ##############" -BackgroundColor Black -ForegroundColor Green
+Write-Host " "
+ForEach ($targetServer in $targetServerList) { Get-QSChk -targetServer $targetServer}
+
+
 ###Get-Smtpk
 
 Write-Host " "
-Write-Host "# >> >  Ketan's Daily Check - SQL Server Report completed.... ($((Get-Date).ToString('dd-MMM-yyyy')) - $((Get-Date).ToString('HH:mm:ss')))  < << #" -BackgroundColor Red -ForegroundColor Yellow
+Write-Host "# >> >  DBA's Daily Check - SQL Server Report completed....Talk to Ketan for any Modification ($((Get-Date).ToString('dd-MMM-yyyy')) - $((Get-Date).ToString('HH:mm:ss')))  < << #" -BackgroundColor Red -ForegroundColor Yellow
 #Write-Host ""
 Write-Host "`nElapsed Time: $(New-TimeSpan -Start $startTime -End (Get-Date))"
 Start-Sleep -s 10
+
 
 ###Get-LoginChk
 Write-Host ""
@@ -2847,7 +3607,7 @@ Write-Host " "
 
 Write-Host "`n##########  EBS Volume Health Check Report:  ##########" -BackgroundColor Black -ForegroundColor Green
 Write-Host " "
-$mountPoints = @("E:\", "F:\", "H:\")
+$mountPoints = @("C:\","D:\","E:\", "F:\", "G:\", "H:\")
 
 # Initialize an empty array to store results
 $outputResults = @()
@@ -2926,4 +3686,3 @@ Get-WmiObject -Class Win32_DiskDrive | % {
 } | Sort-Object Disk, Partition | Format-Table -AutoSize -Property Disk, Partition, SCSITarget, DriveLetter, Boot, 
 VolumeId, Device, VolumeName
 # -----------------------------------------------------------------------------
-# Author:      Ketan Chawda (Modified)
