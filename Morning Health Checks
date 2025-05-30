@@ -1,3 +1,6 @@
+# HOW to RUN this PS1 - .\Morning-chk1.ps1 -serverList "polvforsqlpr01\SQL_01"
+# HOW to RUN this PS1 - .\Morning-chk1.ps1 -serverList "polvforsqlpr01\SQL_01,1471"
+
 # -----------------------------------------------------------------------------
 # Author:      Ketan Chawda (Modified)
 # Date:        Nov 2017
