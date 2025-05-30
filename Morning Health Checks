@@ -1,5 +1,3 @@
-### RUN on POWER SHELL as admin -  .\Morning-chk1.ps1 -serverList "EGLVQPRSQLPR02\SQL_01"
-
 # -----------------------------------------------------------------------------
 # Author:      Ketan Chawda (Modified)
 # Date:        Nov 2017
@@ -20,6 +18,7 @@
 # 26 Mar 2025  Added a new check for SQL Replication service(s) status.
 # 27 Mar 2025  Added a new check for SQL PUB-SUB service(s) status.
 # 21 May 2025  Added a new check for Replication Transaction Summery Report.
+# 25 JUN 2025  Added a new check for Database links servers.
 # -----------------------------------------------------------------------------
 #
 # Copyright (C) 2020 Microsoft Corporation
@@ -3304,6 +3303,7 @@ $results.Tables[0] = $outputResults
 
 ######################################################
 
+
 function Get-DBLinks {
     [CmdletBinding()]
     param (
@@ -3323,28 +3323,24 @@ FROM sys.servers
 WHERE product = 'SQL Server' AND server_id > 0;
 "@
 
-        # Query 2: Check active status of linked servers
+        # Query 2: Check active status of linked servers and identify broken ones
         $linkedServerStatusQuery = @"
-DECLARE @LinkedServerName NVARCHAR(128), @Active BIT, @Message NVARCHAR(MAX) = ''
+DECLARE @LinkedServerName NVARCHAR(128)
 DECLARE @Servers TABLE (
     SRV_NAME NVARCHAR(128),
-    SRV_PROVIDERNAME NVARCHAR(128),
-    SRV_PRODUCT NVARCHAR(128),
-    SRV_DATASOURCE NVARCHAR(4000),
-    SRV_PROVIDERSTRING NVARCHAR(4000),
-    SRV_LOCATION NVARCHAR(4000),
-    SRV_CAT NVARCHAR(128),
     Active BIT DEFAULT 1
 )
 
-INSERT INTO @Servers (SRV_NAME, SRV_PROVIDERNAME, SRV_PRODUCT, SRV_DATASOURCE, SRV_PROVIDERSTRING, SRV_LOCATION, SRV_CAT)
-EXEC sp_linkedservers
+-- Populate server list
+INSERT INTO @Servers (SRV_NAME)
+SELECT name FROM sys.servers WHERE product = 'SQL Server' AND server_id > 0;
 
+-- Cursor to test each linked server
 DECLARE server_cursor CURSOR FOR
-    SELECT SRV_NAME, Active FROM @Servers ORDER BY SRV_NAME
+    SELECT SRV_NAME FROM @Servers ORDER BY SRV_NAME;
 
 OPEN server_cursor
-FETCH NEXT FROM server_cursor INTO @LinkedServerName, @Active
+FETCH NEXT FROM server_cursor INTO @LinkedServerName
 
 WHILE @@FETCH_STATUS = 0
 BEGIN
@@ -3358,18 +3354,17 @@ BEGIN
         SET @isUp = 0
     END CATCH
 
-    IF @Active <> @isUp
-    BEGIN
-        UPDATE @Servers SET Active = @isUp WHERE SRV_NAME = @LinkedServerName
-        SET @Message += 'Active bit on server ' + @LinkedServerName + ' was set to ' + CONVERT(VARCHAR, @isUp) + CHAR(13) + CHAR(10)
-    END
+    UPDATE @Servers SET Active = @isUp WHERE SRV_NAME = @LinkedServerName
 
-    FETCH NEXT FROM server_cursor INTO @LinkedServerName, @Active
+    FETCH NEXT FROM server_cursor INTO @LinkedServerName
 END
+
 CLOSE server_cursor
 DEALLOCATE server_cursor
 
-SELECT SRV_NAME AS [ACTIVE_LINKED_SERVER] FROM @Servers ORDER BY SRV_NAME;
+-- Output active and broken linked servers
+SELECT SRV_NAME AS [ACTIVE_LINKED_SERVER] FROM @Servers WHERE Active = 1 ORDER BY SRV_NAME;
+SELECT SRV_NAME AS [BROKEN_LINKED_SERVER] FROM @Servers WHERE Active = 0 ORDER BY SRV_NAME;
 "@
 
         # Execute queries
@@ -3379,14 +3374,20 @@ SELECT SRV_NAME AS [ACTIVE_LINKED_SERVER] FROM @Servers ORDER BY SRV_NAME;
         # Output results
         if ($linkedServers.Tables[0].Rows.Count -gt 0) {
             Write-Host "`nDatabase Linked Server Details ($($linkedServers.Tables[0].Rows.Count)):" -BackgroundColor DarkBlue -ForegroundColor White
-Write-Host " "
+            Write-Host " "
             $linkedServers.Tables[0] | Format-Table -AutoSize -Property name, provider, data_source, is_linked
         }
 
         if ($linkedServerStatus.Tables[0].Rows.Count -gt 0) {
-            Write-Host "`nDatabase Active Linked Server Status ($($linkedServerStatus.Tables[0].Rows.Count)):" -BackgroundColor DarkGreen -ForegroundColor White
-Write-Host " "
+            Write-Host "`nActive Linked Servers ($($linkedServerStatus.Tables[0].Rows.Count)):" -BackgroundColor DarkGreen -ForegroundColor White
+            Write-Host " "
             $linkedServerStatus.Tables[0] | Format-Table -AutoSize
+        }
+
+        if ($linkedServerStatus.Tables.Count -gt 1 -and $linkedServerStatus.Tables[1].Rows.Count -gt 0) {
+            Write-Host "`nBroken Linked Servers ($($linkedServerStatus.Tables[1].Rows.Count)):" -BackgroundColor DarkRed -ForegroundColor White
+            Write-Host " "
+            $linkedServerStatus.Tables[1] | Format-Table -AutoSize
         }
     }
     catch {
@@ -3394,7 +3395,6 @@ Write-Host " "
     }
 }
 
-# Get-DBLinks
 
 ######################################################
 
